@@ -3,6 +3,7 @@
 	{
 		"disablefatalremindermessage" : 0,
 		"disableloadnotification" : 0,
+		"disablerespawnmessage" : 0,
 		"enablecharactersheetcompatibility" : 0,
 		"enabledragonsoulrevive" : 1,
 		"enablelogging" : 0,
