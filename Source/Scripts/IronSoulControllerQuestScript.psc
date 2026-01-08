@@ -100,6 +100,7 @@ Int  _logLevel = 2 ; 1=Errors, 2=Info, 3=Debug
 Int _maxLives = 10
 Bool _disableLoadNotification = False
 Bool _disableFatalReminderMessage = False
+Bool _disableRespawnMessage = False
 Bool _enableCharacterSheetCompatibility = False
 Bool _enableDragonSoulRevive = True ; Config: EnableDragonSoulRevive (1 = allow Dragon Soul Revive grace handling)
 
@@ -192,6 +193,7 @@ Function LoadLogConfig()
 	_maxLives = 10
 	_disableLoadNotification = False
 	_disableFatalReminderMessage = False
+	_disableRespawnMessage = False
 	_enableCharacterSheetCompatibility = False
 
 	; Read config
@@ -205,6 +207,7 @@ Function LoadLogConfig()
 	endif
 	_disableLoadNotification = (JsonUtil.GetIntValue(LogConfigPath, "DisableLoadNotification", 0) == 1)
 	_disableFatalReminderMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0) == 1)
+	_disableRespawnMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableRespawnMessage", 0) == 1)
 
 	_enableCharacterSheetCompatibility = (JsonUtil.GetIntValue(LogConfigPath, "EnableCharacterSheetCompatibility", 0) == 1)
 	_enableDragonSoulRevive = (JsonUtil.GetIntValue(LogConfigPath, "EnableDragonSoulRevive", 1) == 1)
@@ -244,6 +247,10 @@ Function LoadLogConfig()
 	endif
 	if !JsonUtil.HasIntValue(LogConfigPath, "DisableFatalReminderMessage")
 		JsonUtil.SetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0)
+		wroteDefaults = True
+	endif
+	if !JsonUtil.HasIntValue(LogConfigPath, "DisableRespawnMessage")
+		JsonUtil.SetIntValue(LogConfigPath, "DisableRespawnMessage", 0)
 		wroteDefaults = True
 	endif
 if !JsonUtil.HasIntValue(LogConfigPath, "EnableCharacterSheetCompatibility")
@@ -1824,8 +1831,12 @@ Function HandleRespawnWarning(Actor player)
 
             ; Only show the message if allowed and safe to show.
             if !Utility.IsInMenuMode() && !player.IsDead()
-                if !_disableFatalReminderMessage
-                    Debug.MessageBox(GetRespawnFlavorLine() + "\nPushing your luck again so soon would prove fatal.")
+                if !_disableRespawnMessage
+                    if !_disableFatalReminderMessage
+                        Debug.MessageBox(GetRespawnFlavorLine() + "\nPushing your luck again so soon could prove fatal.")
+                    else
+                        Debug.MessageBox(GetRespawnFlavorLine())
+                    endif
                 endif
             endif
         endif
