@@ -1,0 +1,14 @@
+{
+	"int" : 
+	{
+		"disablefatalremindermessage" : 0,
+		"disableloadmessage" : 0,
+		"enablecharactersheetcompatibility" : 0,
+		"enabledragonsoulrevive" : 1,
+		"enablelogging" : 0,
+		"loglevel" : 2,
+		"maxlives" : 10,
+		"respawncooldownseconds" : 3600,
+		"uninstallmode" : 0
+	}
+}
