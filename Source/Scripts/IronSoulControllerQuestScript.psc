@@ -98,7 +98,7 @@ Bool _logEnabled = False
 Int  _logLevel = 2 ; 1=Errors, 2=Info, 3=Debug
 
 Int _maxLives = 10
-Bool _disableLoadMessage = False
+Bool _disableLoadNotification = False
 Bool _disableFatalReminderMessage = False
 Bool _enableCharacterSheetCompatibility = False
 Bool _enableDragonSoulRevive = True ; Config: EnableDragonSoulRevive (1 = allow Dragon Soul Revive grace handling)
@@ -190,7 +190,7 @@ Function LoadLogConfig()
 	_logEnabled = False
 	_logLevel = 2
 	_maxLives = 10
-	_disableLoadMessage = False
+	_disableLoadNotification = False
 	_disableFatalReminderMessage = False
 	_enableCharacterSheetCompatibility = False
 
@@ -203,7 +203,7 @@ Function LoadLogConfig()
 	if _maxLives < 1
 		_maxLives = 1
 	endif
-	_disableLoadMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableLoadMessage", 0) == 1)
+	_disableLoadNotification = (JsonUtil.GetIntValue(LogConfigPath, "DisableLoadNotification", 0) == 1)
 	_disableFatalReminderMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0) == 1)
 
 	_enableCharacterSheetCompatibility = (JsonUtil.GetIntValue(LogConfigPath, "EnableCharacterSheetCompatibility", 0) == 1)
@@ -238,8 +238,8 @@ Function LoadLogConfig()
 		JsonUtil.SetIntValue(LogConfigPath, "MaxLives", 10)
 		wroteDefaults = True
 	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "DisableLoadMessage")
-		JsonUtil.SetIntValue(LogConfigPath, "DisableLoadMessage", 0)
+	if !JsonUtil.HasIntValue(LogConfigPath, "DisableLoadNotification")
+		JsonUtil.SetIntValue(LogConfigPath, "DisableLoadNotification", 0)
 		wroteDefaults = True
 	endif
 	if !JsonUtil.HasIntValue(LogConfigPath, "DisableFatalReminderMessage")
@@ -482,7 +482,7 @@ EndFunction
 ; It actually stores the locked MaxLives for a given GUID after the first recorded death,
 ; preventing players from increasing MaxLives mid-run by editing config.
 String Function _PoemShownStorageKey(String guid)
-    ; Co-save backup for poem token (obfuscated key)
+    ; Co-save backup for PoemShown boolean (obfuscated key)
     return MakeKey("DoesEnchantRecharge", guid)
 EndFunction
 
@@ -1326,7 +1326,7 @@ EndEvent
 ; arming the load-message job:
 Function ScheduleLoadMessage(Bool isLoadGame, Actor player, String guid)
     ; Load message: always schedule on load (not suppressed by other pending messages).
-    if isLoadGame && !_disableLoadMessage
+    if isLoadGame && !_disableLoadNotification
         _pendingLoadMessage = True
         _loadMessageAt = Utility.GetCurrentRealTime() + LoadMessageDelay
     else
@@ -1727,8 +1727,9 @@ Function HandleBleedoutRespawn(Actor player)
         _SetAuthInt(player, "", GetRespawnKeyById(guid), _EncodeFlag(nowSec, 1), True)
 
         ; Show the Iron Soul poem only after the first free respawn (one-time per character)
-        Int poemTok = _GetAuthInt(player, _PoemShownStorageKey(guid), GetPoemShownKeyById(guid), 0)
-        if _DecodeFlag(poemTok) == 0
+        ; PoemShown is a simple boolean (0/1). No timestamp packing.
+        Int poemShown = _GetAuthInt(player, _PoemShownStorageKey(guid), GetPoemShownKeyById(guid), 0)
+        if poemShown == 0
             String poem = "Some are said to carry an Iron Soul."
             poem += "\nSuch souls do not yield as others do."
             poem += "\nThey may fall, yet not be claimed at once."
@@ -1740,7 +1741,7 @@ Function HandleBleedoutRespawn(Actor player)
             ; Also show the normal respawn reminder immediately on the first free respawn.
             _pendingRespawnWarning = False
             _respawnWarningArmed = False
-            _SetAuthInt(player, _PoemShownStorageKey(guid), GetPoemShownKeyById(guid), _EncodeFlag(nowSec, 1), True)
+            _SetAuthInt(player, _PoemShownStorageKey(guid), GetPoemShownKeyById(guid), 1, True)
         endif
 
         _pendingRespawnWarning = True
@@ -1766,7 +1767,7 @@ EndFunction
 Function HandleLoadMessage(Actor player)
     ; Job A: timed load-game message (runs every load). This is a lightweight
     ; notification and should not be suppressed by other pending messages.
-    if _pendingLoadMessage && !_disableLoadMessage
+    if _pendingLoadMessage && !_disableLoadNotification
         if Utility.GetCurrentRealTime() >= _loadMessageAt
             _pendingLoadMessage = False
 
