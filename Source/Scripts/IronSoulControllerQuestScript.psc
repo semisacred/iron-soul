@@ -7,15 +7,14 @@ Scriptname IronSoulControllerQuestScript extends Quest
 ;  2) Config load/save & runtime flags
 ;  3) JSON presence checks & auth flush
 ;  4) Key helpers
-;  5) Locked max lives (Requiemhealthoffset)
-;  6) Authoritative storage helpers (co-save + JSON)
-;  7) Character identity & GUID recovery
-;  8) Lifecycle & update loop
-;  9) Respawn & cooldown
-; 10) Death handling
-; 11) Uninstall mode
-; 12) Registry & sync
-; 13) Misc utility helpers
+;  5) Authoritative storage helpers (co-save + JSON)
+;  6) Character identity & GUID recovery
+;  7) Lifecycle & update loop
+;  8) Respawn & cooldown
+;  9) Death handling
+;  10) Uninstall mode
+;  11) Registry & sync
+;  12) Misc utility helpers
 
 Import JsonUtil
 Import StorageUtil
@@ -66,6 +65,14 @@ EndFunction
 ; CONFIGURABLE PROPERTIES 
 ; =======================
 
+; ==================
+; TUNABLE CONSTANTS
+; ==================
+; These are *not* user-configurable. Change here in the script only.
+Int Property IRON_SOUL_MAX_LIVES = 10 AutoReadOnly
+Int Property DEFIANT_SOUL_MAX_LIVES = 100 AutoReadOnly
+Int Property RESPAWN_COOLDOWN_SECONDS = 3600 AutoReadOnly
+
 Quest Property RespawnQuest Auto
 
 ; PapyrusUtil JsonUtil paths (StorageUtilData/<path>.json)
@@ -97,12 +104,11 @@ String Property LogPrefix = "[IronSoul]" Auto
 Bool _logEnabled = False
 Int  _logLevel = 2 ; 1=Errors, 2=Info, 3=Debug
 
-Int _maxLives = 10
-Bool _disableLoadNotification = False
 Bool _disableFatalReminderMessage = False
 Bool _disableRespawnMessage = False
+Bool _disableDeathMessage = False
+Bool _disableDragonSoulRevive = False ; Config: DisableDragonSoulRevive (1 = disable Dragon Soul Revive grace handling)
 Bool _enableCharacterSheetCompatibility = False
-Bool _enableDragonSoulRevive = True ; Config: EnableDragonSoulRevive (1 = allow Dragon Soul Revive grace handling)
 
 Bool _uninstallMode = False ; Config: UninstallMode (1 = perform safe uninstall cleanup + disable mod)
 Bool _uninstallRan = False
@@ -116,7 +122,10 @@ Spell Property DROnDying Auto
 Quest Property DRQuest Auto
 GlobalVariable Property IronSoulDSREnabledGV Auto ; Shared toggle written by Iron Soul and read by DSR scripts
 
-Int _respawnCooldownSeconds = 3600 ; seconds of real-time play required to regain free respawn
+Int _respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS ; seconds of real-time play required to regain free respawn
+Int _CHIM = 0 ; config flag: when 1 and deaths >= IRON_SOUL_MAX_LIVES, Defiant Soul mode is active
+Bool _isDefiantMode = False ; cached per-load; derived from CHIM + deaths
+Bool _isEndlessMode = False ; cached per-load; CHIM=1 and deaths>=DEFIANT_SOUL_MAX_LIVES (endless)
 Float _cooldownTickAt = 0.0
 
 ;==============================================================
@@ -190,42 +199,37 @@ Function LoadLogConfig()
 	; Defaults
 	_logEnabled = False
 	_logLevel = 2
-	_maxLives = 10
-	_disableLoadNotification = False
 	_disableFatalReminderMessage = False
 	_disableRespawnMessage = False
+	_disableDeathMessage = False
 	_enableCharacterSheetCompatibility = False
 
 	; Read config
 	int enabled = JsonUtil.GetIntValue(LogConfigPath, "EnableLogging", 0)
 	_logEnabled = (enabled == 1)
 	_logLevel = JsonUtil.GetIntValue(LogConfigPath, "LogLevel", 2)
-
-	_maxLives = JsonUtil.GetIntValue(LogConfigPath, "MaxLives", 10)
-	if _maxLives < 1
-		_maxLives = 1
-	endif
-	_disableLoadNotification = (JsonUtil.GetIntValue(LogConfigPath, "DisableLoadNotification", 0) == 1)
 	_disableFatalReminderMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0) == 1)
 	_disableRespawnMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableRespawnMessage", 0) == 1)
+	_disableDeathMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableDeathMessage", 0) == 1)
 
 	_enableCharacterSheetCompatibility = (JsonUtil.GetIntValue(LogConfigPath, "EnableCharacterSheetCompatibility", 0) == 1)
-	_enableDragonSoulRevive = (JsonUtil.GetIntValue(LogConfigPath, "EnableDragonSoulRevive", 1) == 1)
+	_disableDragonSoulRevive = (JsonUtil.GetIntValue(LogConfigPath, "DisableDragonSoulRevive", 0) == 1)
 	_uninstallMode = (JsonUtil.GetIntValue(LogConfigPath, "UninstallMode", 0) == 1)
+	; CHIM (Defiant/Endless enable) is player-controlled; we do NOT write a default key.
+	_CHIM = JsonUtil.GetIntValue(LogConfigPath, "CHIM", 0)
+	if _CHIM != 1
+		_CHIM = 0
+	endif
 
 	; Publish DSR enabled state for all scripts (DSR reads this GlobalVariable; avoids config reads during death events).
 	if IronSoulDSREnabledGV
-		if _enableDragonSoulRevive
+		if !_disableDragonSoulRevive
 			IronSoulDSREnabledGV.SetValue(1.0)
 		else
 			IronSoulDSREnabledGV.SetValue(0.0)
 		endif
 	endif
-
-	_respawnCooldownSeconds = JsonUtil.GetIntValue(LogConfigPath, "RespawnCooldownSeconds", 3600)
-	if _respawnCooldownSeconds < 0
-		_respawnCooldownSeconds = 0
-	endif
+	_respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS
 	; Create file with defaults if missing (makes it easy to edit)
 	bool wroteDefaults = False
 
@@ -237,14 +241,6 @@ Function LoadLogConfig()
 		JsonUtil.SetIntValue(LogConfigPath, "LogLevel", 2)
 		wroteDefaults = True
 	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "MaxLives")
-		JsonUtil.SetIntValue(LogConfigPath, "MaxLives", 10)
-		wroteDefaults = True
-	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "DisableLoadNotification")
-		JsonUtil.SetIntValue(LogConfigPath, "DisableLoadNotification", 0)
-		wroteDefaults = True
-	endif
 	if !JsonUtil.HasIntValue(LogConfigPath, "DisableFatalReminderMessage")
 		JsonUtil.SetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0)
 		wroteDefaults = True
@@ -253,12 +249,16 @@ Function LoadLogConfig()
 		JsonUtil.SetIntValue(LogConfigPath, "DisableRespawnMessage", 0)
 		wroteDefaults = True
 	endif
+	if !JsonUtil.HasIntValue(LogConfigPath, "DisableDeathMessage")
+		JsonUtil.SetIntValue(LogConfigPath, "DisableDeathMessage", 0)
+		wroteDefaults = True
+	endif
 if !JsonUtil.HasIntValue(LogConfigPath, "EnableCharacterSheetCompatibility")
 		JsonUtil.SetIntValue(LogConfigPath, "EnableCharacterSheetCompatibility", 0)
 		wroteDefaults = True
 	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "EnableDragonSoulRevive")
-		JsonUtil.SetIntValue(LogConfigPath, "EnableDragonSoulRevive", 1)
+	if !JsonUtil.HasIntValue(LogConfigPath, "DisableDragonSoulRevive")
+		JsonUtil.SetIntValue(LogConfigPath, "DisableDragonSoulRevive", 0)
 		wroteDefaults = True
 	endif
 
@@ -266,13 +266,8 @@ if !JsonUtil.HasIntValue(LogConfigPath, "EnableCharacterSheetCompatibility")
 		JsonUtil.SetIntValue(LogConfigPath, "UninstallMode", 0)
 		wroteDefaults = True
 	endif
-
-	if !JsonUtil.HasIntValue(LogConfigPath, "RespawnCooldownSeconds")
-		JsonUtil.SetIntValue(LogConfigPath, "RespawnCooldownSeconds", 3600)
-		wroteDefaults = True
-	endif
 	; If Dragon Soul Revive is disabled, clear any stale grace/pending state.
-	if !_enableDragonSoulRevive
+	if _disableDragonSoulRevive
 		_pendingDeathCheck = False
 		_deathEventLocked = False
 		_dsrSoulsAtDeath = -1
@@ -316,7 +311,7 @@ EndFunction
 ;== END DEBUG LEVEL 3 – ON-SCREEN NOTIFICATION HELPER
 Function LogPropsOnce()
 	LogMsg(LOG_INFO(), "Props: RespawnQuest=" + (RespawnQuest != None) + " Running=" + (RespawnQuest != None && RespawnQuest.IsRunning()))
-	LogMsg(LOG_INFO(), "Config: MaxLives=" + _maxLives + " Logging=" + _logEnabled + " Level=" + _logLevel)
+	LogMsg(LOG_INFO(), "Config: Logging=" + _logEnabled + " Level=" + _logLevel + " CHIM=" + _CHIM)
 EndFunction
 
 ; ============================
@@ -484,109 +479,11 @@ Bool Function _IsDeathsStorageKey(String storageKey)
 	return StringUtil.Find(storageKey, "nullexceptions:") == 0
 EndFunction
 
-; Locked Max Lives (obfuscated)
-; The 'Requiemhealthoffset' key intentionally reads like an unrelated stat tweak.
-; It actually stores the locked MaxLives for a given GUID after the first recorded death,
-; preventing players from increasing MaxLives mid-run by editing config.
 String Function _PoemShownStorageKey(String guid)
     ; Co-save backup for PoemShown boolean (obfuscated key)
     return MakeKey("DoesEnchantRecharge", guid)
 EndFunction
 
-String Function _RequiemHealthOffsetJsonKey(String guid)
-    return "Requiemhealthoffset:" + guid
-EndFunction
-
-String Function _RequiemHealthOffsetStorageKey(String guid)
-    return MakeKey("Requiemhealthoffset", guid)
-EndFunction
-
-; ================
-; LOCKED MAX LIVES
-; ================
-
-Int Function _GetEffectiveMaxLives(Actor player, String guid)
-    Int locked = _GetLockedMaxLives(player, guid)
-    if locked > 0
-        return locked
-    endif
-    return _maxLives
-EndFunction
-
-Int Function _GetLockedMaxLives(Actor player, String guid)
-    if guid == ""
-        return -1
-    endif
-
-    String sKey = _RequiemHealthOffsetStorageKey(guid)
-    String jKey = _RequiemHealthOffsetJsonKey(guid)
-
-    ; 1) Co-save is authoritative when present.
-    Int vStore = StorageUtil.GetIntValue(player, sKey, _AUTH_INT_SENTINEL)
-    if vStore != _AUTH_INT_SENTINEL && vStore > 0
-        return vStore
-    endif
-
-    ; 2) If missing from co-save, fall back to JSON backups using the LOWEST value across stores.
-    ;    Lowest is defensive: it prevents players from raising MaxLives by editing JSON.
-    Int best = -1
-    Bool hasS = False
-    Bool hasM = False
-    Int vS = -1
-    Int vM = -1
-
-    if _jsonExistsShared && JsonUtil.HasIntValue(SharedPath, jKey)
-        vS = JsonUtil.GetIntValue(SharedPath, jKey, -1)
-        if vS > 0
-            hasS = True
-            best = vS
-        endif
-    endif
-
-    if _jsonExistsMirror && JsonUtil.HasIntValue(MirrorPath, jKey)
-        vM = JsonUtil.GetIntValue(MirrorPath, jKey, -1)
-        if vM > 0
-            hasM = True
-            if best < 0 || vM < best
-                best = vM
-            endif
-        endif
-    endif
-
-    ; 3) If recovered from JSON, restore to co-save and log at debug level (silent unless debug enabled).
-    if best > 0 && player
-        StorageUtil.SetIntValue(player, sKey, best)
-        LogMsg(LOG_DBG(), "LOCKED MAX LIVES: restored from JSON (shared=" + vS + " mirror=" + vM + " -> locked=" + best + ")")
-    endif
-
-    return best
-EndFunction
-
-Function _LockMaxLivesIfUnset(Actor player, String guid, Int value)
-    if !player || guid == "" || value < 1
-        return
-    endif
-
-    Int cur = _GetLockedMaxLives(player, guid)
-    if cur > 0
-        return ; already locked
-    endif
-
-    String sKey = _RequiemHealthOffsetStorageKey(guid)
-    String jKey = _RequiemHealthOffsetJsonKey(guid)
-
-    ; Write once: co-save authority + JSON backups.
-    StorageUtil.SetIntValue(player, sKey, value)
-
-    if _jsonExistsShared
-        JsonUtil.SetIntValue(SharedPath, jKey, value)
-        JsonUtil.Save(SharedPath)
-    endif
-    if _jsonExistsMirror
-        JsonUtil.SetIntValue(MirrorPath, jKey, value)
-        JsonUtil.Save(MirrorPath)
-    endif
-EndFunction
 
 ; =====================
 ; AUTHORITATIVE STORAGE
@@ -1248,7 +1145,6 @@ String _sessionGuid = ""
 String _deathAVName = "DEPRECATED05"
 
 Float _lastCurrentSyncAt = -9999.0
-Float _lastAuthHealSaveAt = -9999.0
 Float _lastCooldownSaveAt = -9999.0
 
 Bool _globalSyncDoneThisSession = False
@@ -1333,7 +1229,7 @@ EndEvent
 ; arming the load-message job:
 Function ScheduleLoadMessage(Bool isLoadGame, Actor player, String guid)
     ; Load message: always schedule on load (not suppressed by other pending messages).
-    if isLoadGame && !_disableLoadNotification
+    if isLoadGame
         _pendingLoadMessage = True
         _loadMessageAt = Utility.GetCurrentRealTime() + LoadMessageDelay
     else
@@ -1372,10 +1268,10 @@ Function GameReloaded(Bool isLoadGame)
         SyncCurrentCharacterImmediate(guid)
         ; Read healed value and sync actor value
         Int deathsNow = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
-        ; If this character has already died, lock MaxLives now (prevents mid-run config edits).
-        if deathsNow > 0
-            _LockMaxLivesIfUnset(player, guid, _maxLives)
-        endif
+        ; Cache current mode + respawn cooldown for this load.
+        _isEndlessMode = (_CHIM == 1 && deathsNow >= DEFIANT_SOUL_MAX_LIVES)
+        _isDefiantMode = (_CHIM == 1 && deathsNow >= IRON_SOUL_MAX_LIVES && deathsNow < DEFIANT_SOUL_MAX_LIVES)
+        _respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS
         _SyncDeathAV(player, deathsNow)
         ; Enforce essential/quest state using current identity
         SetEssentialAndStartQuestIfNeeded(player, guid, name)
@@ -1741,7 +1637,7 @@ Function HandleBleedoutRespawn(Actor player)
             poem += "\nSuch souls do not yield as others do."
             poem += "\nThey may fall, yet not be claimed at once."
             poem += "\nEach return draws deeper from the iron."
-            poem += "\n\nYour soul may endure " + _maxLives + " deaths."
+            poem += "\n\nYour soul may endure " + IRON_SOUL_MAX_LIVES + " deaths."
             poem += "\nWhen it is spent, nothing remains to rise."
             Utility.Wait(2.0)
             Debug.MessageBox(poem)
@@ -1772,9 +1668,8 @@ Function HandleRespawnCooldown(Actor player)
 EndFunction
 
 Function HandleLoadMessage(Actor player)
-    ; Job A: timed load-game message (runs every load). This is a lightweight
-    ; notification and should not be suppressed by other pending messages.
-    if _pendingLoadMessage && !_disableLoadNotification
+    ; Job A: timed load-game job (runs every load).
+    if _pendingLoadMessage
         if Utility.GetCurrentRealTime() >= _loadMessageAt
             _pendingLoadMessage = False
 
@@ -1788,7 +1683,7 @@ Function HandleLoadMessage(Actor player)
                 return
             endif
 
-            ; Update last known name for tooling/debug (only if the name is meaningful).
+            ; Write last-known name (best-effort)
             if IsValidPlayerName(name)
                 JsonUtil.SetStringValue(SharedPath, "LastKnownName:" + guid, name)
                 JsonUtil.SetStringValue(MirrorPath, "LastKnownName:" + guid, name)
@@ -1797,16 +1692,37 @@ Function HandleLoadMessage(Actor player)
             endif
 
             Int deaths = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
-            Int maxLives = _GetEffectiveMaxLives(player, guid)
+            Int maxLives = _GetEffectiveMaxLives(player, guid, deaths)
             Int usedTok = _GetAuthInt(player, "", GetRespawnKeyById(guid), 0)
             Int used = _DecodeFlag(usedTok)
 
-            ; If all lives are gone, perform the fatal quit sequence
+            Bool endless = (_CHIM == 1 && deaths >= DEFIANT_SOUL_MAX_LIVES)
+            Bool defiant = (_CHIM == 1 && deaths >= IRON_SOUL_MAX_LIVES && deaths < DEFIANT_SOUL_MAX_LIVES)
+
+            ; One-time Defiant Soul entry message (never shown for Endless).
+            if defiant
+                String kDef = "RequiemStaminaBoost:" + guid
+                if StorageUtil.GetIntValue(player, kDef, 0) != 1
+                    StorageUtil.SetIntValue(player, kDef, 1)
+                    Debug.MessageBox("Death claimed you. You refused.\nDefiant Soul awakened.")
+                endif
+            endif
+
+            ; Enforce fallen saves unless Endless mode is active.
             if deaths >= maxLives
-                Debug.MessageBox("NO STRENGTH REMAINS TO RISE\nYOUR SOUL IS CLAIMED\nSOVNGARDE AWAITS THE FALLEN")
-                Game.QuitToMainMenu()
+                if !endless
+                    Debug.MessageBox("NO STRENGTH REMAINS TO RISE\nYOUR SOUL IS CLAIMED\nSOVNGARDE AWAITS THE FALLEN")
+                    Game.QuitToMainMenu()
+                    return
+                endif
+            endif
+            ; Load notifications are always enabled.
+            if endless
+                Debug.Notification("Your soul yearns for rest. Deaths: " + deaths + " / ???")
+            elseif defiant
+                Debug.Notification("Your Defiant Soul endures. Deaths: " + deaths + " / " + DEFIANT_SOUL_MAX_LIVES)
             else
-                Debug.Notification("Your Iron Soul endures. Deaths: " + deaths + " / " + maxLives)
+                Debug.Notification("Your Iron Soul endures. Deaths: " + deaths + " / " + IRON_SOUL_MAX_LIVES)
                 if used > 0 && !_disableFatalReminderMessage
                     Debug.Notification("Your recent trial has left you shaken.")
                 endif
@@ -1853,6 +1769,8 @@ Bool Function HandleDisableRespawn(Actor player)
             _pendingDisableRespawn = False
             _pendingRespawnWarning = False
             _respawnWarningArmed = False
+            _deathEventLocked = False
+            _bleedoutForcedKill = False
             return True
         endif
         if !player.IsBleedingOut() && !player.IsDead()
@@ -1980,7 +1898,7 @@ Function HandlePlayerDying(Actor akKiller)
 	; Arm DSR grace ONLY if a dragon soul is actually available right now.
 	; We also snapshot the soul count so we can prove DSR really consumed one.
 	Int soulsNow = player.GetActorValue("DragonSouls") as Int
-	if _enableDragonSoulRevive && soulsNow > 0
+	if !_disableDragonSoulRevive && soulsNow > 0
 		_dsrSoulsAtDeath = soulsNow
 	_deathEventLocked = True
 	_pendingDeathCheck = True
@@ -2007,7 +1925,9 @@ Function TrueDeathAndQuit(Actor player)
 	String guid = GetCharacterGUID(player)
 	if guid == ""
 		LogMsg(LOG_ERR(), "TRUE DEATH: missing CharacterGUID; exiting without logging state")
-		Debug.MessageBox("SOVNGARDE CALLS\n\nDeath occurred but IronSoul could not determine character identity. Exiting to prevent state corruption.")
+		if !_disableDeathMessage
+		    Debug.MessageBox("SOVNGARDE CALLS\n\nDeath occurred but IronSoul could not determine character identity. Exiting to prevent state corruption.")
+		endif
 		Utility.Wait(2.0)
 		Debug.QuitGame()
 		return
@@ -2031,16 +1951,26 @@ Function TrueDeathAndQuit(Actor player)
     player.GetActorBase().SetEssential(False)
 
 	int deathsNow = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
-	Int maxLives = _GetEffectiveMaxLives(player, guid)
-    ; If the character has reached or exceeded the maximum allowed deaths then
-    ; immediately display the final death warning used on load (this mirrors
-    ; the load‑screen behaviour where a character with no lives left sees
-    ; "NO STRENGTH REMAINS TO RISE" and is returned to the menu).  Otherwise
-    ; show the normal Sovngarde call with the current death count.
-    if deathsNow >= maxLives
+
+    ; Hard cap used for "final death" handling:
+    ;  - Iron Soul: IRON_SOUL_MAX_LIVES
+    ;  - Defiant Soul: DEFIANT_SOUL_MAX_LIVES (only if CHIM=1 and deathsNow >= IRON_SOUL_MAX_LIVES)
+    ; Note: Endless mode is an explicit post-cap opt-in done by the player after reaching DEFIANT_SOUL_MAX_LIVES,
+    ; so TRUE DEATH at 100 should still force CHIM back to 0 by default.
+    Int hardCap = IRON_SOUL_MAX_LIVES
+    if _CHIM == 1 && deathsNow >= IRON_SOUL_MAX_LIVES
+        hardCap = DEFIANT_SOUL_MAX_LIVES
+    endif
+
+    if deathsNow == hardCap
+        ; Character is fallen. Force CHIM off by default so continuing requires an explicit opt-in.
+        JsonUtil.SetIntValue(LogConfigPath, "CHIM", 0)
+        JsonUtil.Save(LogConfigPath)
         Debug.MessageBox("NO STRENGTH REMAINS TO RISE\nYOUR SOUL IS CLAIMED\nSOVNGARDE AWAITS THE FALLEN")
     else
-	    Debug.MessageBox("SOVNGARDE CALLS\n" + "\nDeath Count: " + deathsNow)
+        if !_disableDeathMessage
+		    Debug.MessageBox("SOVNGARDE CALLS\n\nDeath Count: " + deathsNow)
+	    endif
     endif
 
     ; Give the player time to read the message box before quitting.  During this wait we ensure
@@ -2071,7 +2001,7 @@ Bool Function HandlePendingDeathCheck(Actor player)
     endif
 
     ; If DSR is disabled, do not honor any pending grace state.
-    if !_enableDragonSoulRevive
+    if _disableDragonSoulRevive
         _pendingDeathCheck = False
         _dsrSoulsAtDeath = -1
         _deathEventLocked = False
@@ -2136,10 +2066,6 @@ Function IncrementTrueDeath(Actor player, String guid, String displayName)
 
 	_SetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), deaths, True)
 
-	; Lock MaxLives after the first recorded death so config edits can't increase lives mid-run.
-	if deaths == 1
-		_LockMaxLivesIfUnset(player, guid, _maxLives)
-	endif
 
 	_SyncDeathAV(player, deaths)
 
@@ -2155,21 +2081,34 @@ EndFunction
 ; ==============
 ; UNINSTALL MODE
 ; ==============
-
+;
 ; When UninstallMode=1 in config:
-;  - All Iron Soul functionality is disabled.
-;  - A one-time cleanup pass clears any risky runtime state (deferred kill / essential / ghost / paralysis).
-;  - The controller quest stops itself.
+;  - Iron Soul disables itself (no death enforcement / no gameplay systems).
+;  - A one-time cleanup pass clears risky runtime state (deferred kill / ghost / paralysis).
+;  - IMPORTANT: Respawn is intentionally left ENABLED.
+;       * We do NOT stop RespawnQuest here.
+;       * We keep the player Essential so Respawn can continue to intercept death.
+;  - The controller quest stops itself once cleanup completes.
+;
+; If the user wants to uninstall Respawn too, they should use Respawn’s own uninstall/MCM,
+; which will stop its quests and restore Essential as needed.
 Function HandleUninstallMode(Actor player)
+    ; If uninstall has already completed in this save, keep the quest permanently inert.
     if _uninstallRan
         if !_uninstallNotified
             _uninstallNotified = True
-            Debug.MessageBox("Iron Soul uninstalled successfully.\n\nPlease make a new save now, then uninstall the mod.")
+            Debug.MessageBox(
+                "Iron Soul has been safely disabled.\n" + \
+                "Respawn remains enabled.\n\n" + \
+                "Make a new save now.\n" + \
+                "You may now uninstall Iron Soul, or leave it installed in its disabled state."
+            )
         endif
+        Stop()
         return
     endif
 
-    ; Stage 0: cancel pending jobs so no gameplay logic runs during cleanup.
+    ; Stage 0: cancel pending Iron Soul jobs so no gameplay logic runs during cleanup.
     if _uninstallStage == 0
         _pendingDisableRespawn = False
         _pendingLoadMessage = False
@@ -2178,9 +2117,12 @@ Function HandleUninstallMode(Actor player)
         _respawnWarningArmed = False
         _pendingDeathResync = False
 
-        ; Stop linked respawn quest, if any.
+        ; IMPORTANT: Do NOT stop RespawnQuest in uninstall mode.
+        ; Respawn relies on the player being Essential and will manage its own lifecycle/uninstall.
         if RespawnQuest
-            RespawnQuest.Stop()
+            if !RespawnQuest.IsRunning()
+                RespawnQuest.Start()
+            endif
         endif
 
         _uninstallStage = 1
@@ -2195,6 +2137,7 @@ Function HandleUninstallMode(Actor player)
 
     ; Stage 1: release any deferred-kill state while the player is protected.
     if _uninstallStage == 1
+        ; Keep player protected while we clear risky states.
         player.GetActorBase().SetEssential(True)
         player.EndDeferredKill()
 
@@ -2207,7 +2150,7 @@ Function HandleUninstallMode(Actor player)
         return
     endif
 
-    ; Stage 2: restore and clear flags, remove optional DSR assets, then stop this quest.
+    ; Stage 2: restore and clear flags, remove optional Iron Soul assets, then stop this quest.
     if _uninstallStage == 2
         if Utility.GetCurrentRealTime() < _uninstallAt
             QueueUpdate(0.10)
@@ -2217,9 +2160,11 @@ Function HandleUninstallMode(Actor player)
         player.RestoreAV("Health", 1000.0)
         player.SetGhost(False)
         player.SetAV("Paralysis", 0.0)
-        player.GetActorBase().SetEssential(False)
 
-        ; Optional: remove DSR spells/quest if provided.
+        ; IMPORTANT: Leave player Essential so Respawn can continue to function.
+        player.GetActorBase().SetEssential(True)
+
+        ; Optional: remove Iron Soul DSR spells/quest if provided.
         if DRAbility && player.HasSpell(DRAbility)
             player.RemoveSpell(DRAbility)
         endif
@@ -2234,7 +2179,9 @@ Function HandleUninstallMode(Actor player)
 
         if !_uninstallNotified
             _uninstallNotified = True
-            Debug.MessageBox("Iron Soul uninstalled successfully.\n\nPlease make a new save now, then uninstall the mod.")
+            Debug.MessageBox(
+                "Iron Soul has been safely disabled.\n" + "Make a new save now." + "You may now uninstall the mod, or leave it installed in its disabled state."
+            )
         endif
 
         Stop()

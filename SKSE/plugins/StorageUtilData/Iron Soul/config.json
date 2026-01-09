@@ -1,15 +1,13 @@
 {
 	"int" : 
 	{
-		"disablefatalremindermessage" : 0,
-		"disableloadnotification" : 0,
-		"disablerespawnmessage" : 0,
-		"enablecharactersheetcompatibility" : 0,
-		"enabledragonsoulrevive" : 1,
-		"enablelogging" : 0,
-		"loglevel" : 2,
-		"maxlives" : 10,
-		"respawncooldownseconds" : 3600,
-		"uninstallmode" : 0
+		"DisableDeathMessage" : 0,
+		"DisableDragonSoulRevive" : 0,
+		"DisableFatalReminderMessage" : 0,
+		"DisableRespawnMessage" : 0,
+		"EnableCharacterSheetCompatibility" : 0,
+		"EnableLogging" : 0,
+		"LogLevel" : 2,
+		"UninstallMode" : 0
 	}
 }
