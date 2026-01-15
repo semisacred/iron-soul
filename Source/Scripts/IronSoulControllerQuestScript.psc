@@ -710,7 +710,7 @@ EndFunction
 ; =========================
 ; SOUL TIER (OBFUSCATED INT)
 ; =========================
-; Tier state: 0=Iron, 1=Gilded, 2=Platinum. Platinum always takes priority.
+; Tier state: 0=Iron, 1=Silver, 2=Gilded, 3=Ebon, 4=Platinum. Highest eligible tier always takes priority.
 ; This value is mirrored to Shared/Mirror JSON and backed up to co-save via an obfuscated key.
 String Function GetSoulTierKeyById(String charId)
     return MakeKey("InternalRuntimeUpdateState", charId)
@@ -1675,48 +1675,56 @@ EndFunction
 
 Function GameReloaded(Bool isLoadGame)
     LoadLogConfig()
-	_RefreshJsonExistCache()
+    _RefreshJsonExistCache()
+
     Actor player = Game.GetPlayer()
     if !player
         LogMsg(LOG_ERR(), "OnPlayerLoadGame: player None (alias not filled yet?)")
         return
     endif
+
     String name = player.GetDisplayName()
     String guid = GetCharacterGUID(player)
     LogMsg(LOG_INFO(), "OnPlayerLoadGame: Player=" + name + " GUID=" + guid)
+
     ; If the player already has a valid name, finalise the provisional GUID immediately.
     if guid != "" && IsValidPlayerName(name)
         FinalizeCharacterIdentity(player, guid)
     endif
+
     ; Reset transient state if this is a new character in the same session.
     if guid != "" && guid != _sessionGuid
         ResetTransientStateForNewGuid(guid)
     endif
-    ; Persist metadata: active GUID, signature and name mapping.
+
+    ; Persist metadata: active GUID, signature, and name mapping.
     String sig = BuildCharacterSignature(player)
     PersistGuidMetadata(player, guid, name, sig)
+
     ; One-time reconcile: heal deleted/tampered stores and sync character sheet death AV.
     if guid != ""
-        ; Heal / reconcile authoritative stores first
+        ; Heal / reconcile authoritative stores first.
         SyncCurrentCharacterImmediate(guid)
-        ; Read healed value and sync actor value
+        ; Read healed value and sync actor value.
         Int deathsNow = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
         ; Cache respawn cooldown for this load.
         _respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS
         _SyncDeathAV(player, deathsNow)
-        ; Enforce essential/quest state using current identity
+        ; Enforce essential / quest state using current identity.
         SetEssentialAndStartQuestIfNeeded(player, guid, name)
     endif
+
     ; Perform one-time global heal/sync after load.
     if !_globalSyncDoneThisSession
         _globalSyncDoneThisSession = True
         SyncAllKnownCharactersOnce()
     endif
+
     EnsureVisibleLogsOnLoad()
     LogPropsOnce()
+
     ; Schedule load message.
     ScheduleLoadMessage(isLoadGame, player, guid)
-return
 EndFunction
 
 Event OnUpdate()
