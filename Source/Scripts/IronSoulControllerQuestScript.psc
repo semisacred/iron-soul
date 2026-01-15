@@ -4,7 +4,7 @@ Scriptname IronSoulControllerQuestScript extends Quest
 ; TABLE OF CONTENTS
 ; =================
 ;  1) Log levels & logging helpers
-;  2) Config load/save & runtime flags
+;  2) JSON config load & runtime flags
 ;  3) JSON presence checks & auth flush
 ;  4) Key helpers
 ;  5) Authoritative storage helpers (co-save + JSON)
@@ -31,6 +31,11 @@ Int Function _SetIntIfChanged(String pathA, String keyA, Int valA, String pathB,
             JsonUtil.SetIntValue(pathA, keyA, valA)
             dirty = dirty + 1
         endif
+
+    ; NOTE:
+    ; Soul Bonuses (Iron 10% / Silver 15% / Gilded 20% / Ebon 25% / Platinum 30%)
+    ; are TODO and are fully suppressed while Defiant OR Endless mode is active.
+
     endif
     if _jsonExistsMirror
         Int curB = JsonUtil.GetIntValue(pathB, keyB, -2147483648)
@@ -71,7 +76,62 @@ EndFunction
 ; These are *not* user-configurable. Change here in the script only.
 Int Property IRON_SOUL_MAX_LIVES = 10 AutoReadOnly
 Int Property DEFIANT_SOUL_MAX_LIVES = 100 AutoReadOnly
+
+; ==================
+; EFFECTIVE MAX LIVES
+; ==================
+; Returns the death cap used for load enforcement and notifications:
+;  - Iron Soul: 10
+;  - Defiant Soul (activated or pending activation): 100
+;  - Endless: effectively unbounded (only if CHIM opt-in is enabled and deaths have reached the Endless threshold)
+Int Function _GetEffectiveMaxLives(Actor player, String guid, Int deathsNow)
+    if !player || guid == ""
+        return IRON_SOUL_MAX_LIVES
+    endif
+
+    Int defPending = _GetAuthInt(player, _DefiantPendingStorageKey(guid), GetDefiantPendingKeyById(guid), 0)
+    Int defActive  = _GetAuthInt(player, _DefiantActivatedStorageKey(guid), GetDefiantActivatedKeyById(guid), 0)
+
+    ; Endless opt-in is controlled by Endless.CHIM (see LoadConfig()).
+    ; If Defiant is not enabled, Endless begins once deaths reach the Iron cap.
+    ; If Defiant is enabled (pending or active), Endless begins once deaths reach the Defiant cap.
+    Int endlessStart = IRON_SOUL_MAX_LIVES
+    if defActive == 1 || defPending == 1
+        endlessStart = DEFIANT_SOUL_MAX_LIVES
+    endif
+
+    ; Endless is an explicit opt-in via config.json (Endless.CHIM = 1 or "1").
+    Bool endless = (_CHIM == 1 && deathsNow >= endlessStart)
+    if endless
+        return 2147483647
+    endif
+
+    if defActive == 1 || defPending == 1
+        return DEFIANT_SOUL_MAX_LIVES
+    endif
+
+    return IRON_SOUL_MAX_LIVES
+EndFunction
 Int Property RESPAWN_COOLDOWN_SECONDS = 3600 AutoReadOnly
+
+; =============================
+; 25 DRAGON SOULS FEATS / ACHV
+; =============================
+; Feats of Strength: per-character unlocks based on confirmed Dragon Souls obtained and death count.
+; then evaluate Feats of Strength per character and display one-time unlock messages.
+; Future: Soul Bonus tiers (Iron 10% / Silver 15% / Gilded 20% / Ebon 25% / Platinum 30%) will be applied via a separate ability/effect system.
+; All Soul Bonuses are lost once Defiant activates (after the 10th-death Defiant transition + next load).
+
+
+; Anti-cheat: track Feats Dragon Souls via a guarded counter (blocks large console jumps)
+Bool disableDragonSoulAnticheat = False
+
+; Optional Feats toggles (JSON: Data\SKSE\Plugins\StorageUtilData\Iron Soul\config.json)
+; JSON keys (config.json)
+; Feats.DisableDefiantFeat=0/1        (1 = disable Defiant Soul Feat unlock + messaging)
+; Feats.DisableSoulTierFeats=0/1 (disables Silver/Gilded/Ebon/Platinum tier feats)   (1 = disable Soul Tier Feats (Silver/Gilded/Ebon/Platinum) tiering + messaging)
+Bool _disableDefiantSoulFeat = False
+Bool _disableSoulTierFeats = False
 
 Quest Property RespawnQuest Auto
 
@@ -97,20 +157,20 @@ Float Property CurrentSyncMinIntervalSeconds = 300.0 Auto ; current-character sy
 ; LOGGING + GAMEPLAY CONFIG (JSON)
 ; ================================
 
-; Stored at: Data\SKSE\Plugins\StorageUtilData\Iron Soul\config.json
-String Property LogConfigPath = "Iron Soul/config" Auto
 String Property LogPrefix = "[IronSoul]" Auto
 
 Bool _logEnabled = False
 Int  _logLevel = 2 ; 1=Errors, 2=Info, 3=Debug
+Int  _logNotificationMode = 0 ; JSON: Config.LogNotificationMode (0=Papyrus log only, 1=also show level 1-2 as HUD notifications)
 
 Bool _disableFatalReminderMessage = False
 Bool _disableRespawnMessage = False
 Bool _disableDeathMessage = False
-Bool _disableDragonSoulRevive = False ; Config: DisableDragonSoulRevive (1 = disable Dragon Soul Revive grace handling)
 Bool _enableCharacterSheetCompatibility = False
+Bool _disableDragonSoulRevive = False ; JSON: [Config] DisableDragonSoulRevive (1 = disable Dragon Soul Revive grace handling)
+Bool _disableSoulBonus = False ; JSON: [Config] DisableSoulBonus (1 = suppress Soul Bonus effects/messages)
 
-Bool _uninstallMode = False ; Config: UninstallMode (1 = perform safe uninstall cleanup + disable mod)
+Bool _uninstallMode = False ; JSON: [Config] UninstallMode (1 = perform safe uninstall cleanup + disable mod)
 Bool _uninstallRan = False
 Bool _uninstallNotified = False
 Int _uninstallStage = 0
@@ -120,12 +180,12 @@ Float _uninstallAt = 0.0
 Spell Property DRAbility Auto
 Spell Property DROnDying Auto
 Quest Property DRQuest Auto
+
+Quest Property DLC2MQ06 Auto
 GlobalVariable Property IronSoulDSREnabledGV Auto ; Shared toggle written by Iron Soul and read by DSR scripts
 
-Int _respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS ; seconds of real-time play required to regain free respawn
-Int _CHIM = 0 ; config flag: when 1 and deaths >= IRON_SOUL_MAX_LIVES, Defiant Soul mode is active
-Bool _isDefiantMode = False ; cached per-load; derived from CHIM + deaths
-Bool _isEndlessMode = False ; cached per-load; CHIM=1 and deaths>=DEFIANT_SOUL_MAX_LIVES (endless)
+Int _respawnCooldownSeconds ; seconds of real-time play required to regain free respawn
+Int _CHIM = 0 ; JSON: Endless.CHIM (0=disabled, 1=enabled). Default is 0; users may opt in by adding the key themselves.
 Float _cooldownTickAt = 0.0
 
 ;==============================================================
@@ -195,88 +255,193 @@ EndFunction
 ; CONFIG AND LOGGING
 ; ==================
 
+; JSON config (read-only; never written by the script)
+; Location: Data\SKSE\Plugins\StorageUtilData\Iron Soul\config.json
+; Notes:
+;  - All keys are optional. If missing, the script defaults apply.
+;  - Keys are read via JsonUtil paths, e.g.: .Config.EnableLogging
+String Function _ConfigFile()
+    ; JsonUtil paths are rooted at Data\SKSE\Plugins\StorageUtilData\ and auto-append .json
+    return "Iron Soul/config"
+EndFunction
+
+Int Function _CfgGetInt(String section, String keyName, Int defaultVal)
+    return JsonUtil.GetPathIntValue(_ConfigFile(), "." + section + "." + keyName, defaultVal)
+EndFunction
+
+String Function _CfgGetString(String section, String keyName, String defaultVal)
+    return JsonUtil.GetPathStringValue(_ConfigFile(), "." + section + "." + keyName, defaultVal)
+EndFunction
+
+Bool Function _CfgGetBool(String section, String keyName, Bool defaultVal)
+    return JsonUtil.GetPathBoolValue(_ConfigFile(), "." + section + "." + keyName, defaultVal)
+EndFunction
+
 Function LoadLogConfig()
-	; Defaults
-	_logEnabled = False
-	_logLevel = 2
-	_disableFatalReminderMessage = False
-	_disableRespawnMessage = False
-	_disableDeathMessage = False
-	_enableCharacterSheetCompatibility = False
+    ; Defaults (script defaults)
+    _logEnabled = False
+    _logLevel = 2
+    _logNotificationMode = 0
+    _disableFatalReminderMessage = False
+    _disableRespawnMessage = False
+    _disableDeathMessage = False
+    _enableCharacterSheetCompatibility = False
+    _disableDragonSoulRevive = False
+    _disableSoulBonus = False
+    _uninstallMode = False
+    _CHIM = 0
 
-	; Read config
-	int enabled = JsonUtil.GetIntValue(LogConfigPath, "EnableLogging", 0)
-	_logEnabled = (enabled == 1)
-	_logLevel = JsonUtil.GetIntValue(LogConfigPath, "LogLevel", 2)
-	_disableFatalReminderMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0) == 1)
-	_disableRespawnMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableRespawnMessage", 0) == 1)
-	_disableDeathMessage = (JsonUtil.GetIntValue(LogConfigPath, "DisableDeathMessage", 0) == 1)
+    ; Read JSON overrides (all optional)
+    ; File: Data\SKSE\Plugins\StorageUtilData\Iron Soul\config.json
+    ; Config.*
+    ; Config.EnableLogging=0/1
+    ; Config.LogLevel=1/2/3
+    ; Config.LogNotificationMode=0/1  (0 = Papyrus log only, 1 = show level 1-2 logs in HUD notifications)
+    ; Config.DisableDeathMessage=0/1
+    ; Config.DisableDragonSoulRevive=0/1
+    ; Config.DisableFatalReminderMessage=0/1
+    ; Config.DisableRespawnMessage=0/1
+    ; Config.DisableSoulBonus=0/1
+    ; Config.UninstallMode=0/1
+    ; Experimental.*
+    ; Experimental.EnableCharacterSheetCompatibility=0/1
+    ; Feats.*
+    ; Feats.DisableDefiantFeat=0/1
+    ; Feats.DisableSoulTierFeats=0/1 (disables Silver/Gilded/Ebon/Platinum tier feats)
+    ; Feats.DisableDragonSoulAnticheat=0/1   ; optional advanced toggle
+    ; Endless.*
+    ; Endless.CHIM is an explicit opt-in:
+    ;   - 0 or missing => Endless disabled (default)
+    ;   - 1 or "1"    => Endless enabled
+    ;
+    ; Visible JSON note:
+    ; Visible per-character JSON files are only written after a stable LastKnownName:<guid> mapping exists
+    ; (post-first-load). The script never writes visible files using provisional GUID-based filenames.
 
-	_enableCharacterSheetCompatibility = (JsonUtil.GetIntValue(LogConfigPath, "EnableCharacterSheetCompatibility", 0) == 1)
-	_disableDragonSoulRevive = (JsonUtil.GetIntValue(LogConfigPath, "DisableDragonSoulRevive", 0) == 1)
-	_uninstallMode = (JsonUtil.GetIntValue(LogConfigPath, "UninstallMode", 0) == 1)
-	; CHIM (Defiant/Endless enable) is player-controlled; we do NOT write a default key.
-	_CHIM = JsonUtil.GetIntValue(LogConfigPath, "CHIM", 0)
-	if _CHIM != 1
-		_CHIM = 0
-	endif
+    Int v = _CfgGetInt("Config", "EnableLogging", -1)
+    if v == 0
+        _logEnabled = False
+    elseif v == 1
+        _logEnabled = True
+    endif
 
-	; Publish DSR enabled state for all scripts (DSR reads this GlobalVariable; avoids config reads during death events).
-	if IronSoulDSREnabledGV
-		if !_disableDragonSoulRevive
-			IronSoulDSREnabledGV.SetValue(1.0)
-		else
-			IronSoulDSREnabledGV.SetValue(0.0)
-		endif
-	endif
-	_respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS
-	; Create file with defaults if missing (makes it easy to edit)
-	bool wroteDefaults = False
+    v = _CfgGetInt("Config", "LogLevel", -1)
+    if v >= 1 && v <= 3
+        _logLevel = v
+    endif
 
-	if !JsonUtil.HasIntValue(LogConfigPath, "EnableLogging")
-		JsonUtil.SetIntValue(LogConfigPath, "EnableLogging", 0)
-		wroteDefaults = True
-	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "LogLevel")
-		JsonUtil.SetIntValue(LogConfigPath, "LogLevel", 2)
-		wroteDefaults = True
-	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "DisableFatalReminderMessage")
-		JsonUtil.SetIntValue(LogConfigPath, "DisableFatalReminderMessage", 0)
-		wroteDefaults = True
-	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "DisableRespawnMessage")
-		JsonUtil.SetIntValue(LogConfigPath, "DisableRespawnMessage", 0)
-		wroteDefaults = True
-	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "DisableDeathMessage")
-		JsonUtil.SetIntValue(LogConfigPath, "DisableDeathMessage", 0)
-		wroteDefaults = True
-	endif
-if !JsonUtil.HasIntValue(LogConfigPath, "EnableCharacterSheetCompatibility")
-		JsonUtil.SetIntValue(LogConfigPath, "EnableCharacterSheetCompatibility", 0)
-		wroteDefaults = True
-	endif
-	if !JsonUtil.HasIntValue(LogConfigPath, "DisableDragonSoulRevive")
-		JsonUtil.SetIntValue(LogConfigPath, "DisableDragonSoulRevive", 0)
-		wroteDefaults = True
-	endif
+    v = _CfgGetInt("Config", "LogNotificationMode", -1)
+    if v == 0
+        _logNotificationMode = 0
+    elseif v == 1
+        _logNotificationMode = 1
+    endif
 
-	if !JsonUtil.HasIntValue(LogConfigPath, "UninstallMode")
-		JsonUtil.SetIntValue(LogConfigPath, "UninstallMode", 0)
-		wroteDefaults = True
-	endif
-	; If Dragon Soul Revive is disabled, clear any stale grace/pending state.
-	if _disableDragonSoulRevive
-		_pendingDeathCheck = False
-		_deathEventLocked = False
-		_dsrSoulsAtDeath = -1
-		_deathCheckAt = 0.0
-	endif
+    v = _CfgGetInt("Config", "DisableFatalReminderMessage", -1)
+    if v == 0
+        _disableFatalReminderMessage = False
+    elseif v == 1
+        _disableFatalReminderMessage = True
+    endif
 
-	if wroteDefaults
-		JsonUtil.Save(LogConfigPath)
-	endif
+    v = _CfgGetInt("Config", "DisableRespawnMessage", -1)
+    if v == 0
+        _disableRespawnMessage = False
+    elseif v == 1
+        _disableRespawnMessage = True
+    endif
+
+    v = _CfgGetInt("Config", "DisableDeathMessage", -1)
+    if v == 0
+        _disableDeathMessage = False
+    elseif v == 1
+        _disableDeathMessage = True
+    endif
+
+    v = _CfgGetInt("Experimental", "EnableCharacterSheetCompatibility", -1)
+    if v == 0
+        _enableCharacterSheetCompatibility = False
+    elseif v == 1
+        _enableCharacterSheetCompatibility = True
+    endif
+
+    v = _CfgGetInt("Config", "DisableDragonSoulRevive", -1)
+    if v == 0
+        _disableDragonSoulRevive = False
+    elseif v == 1
+        _disableDragonSoulRevive = True
+    endif
+
+    v = _CfgGetInt("Config", "DisableSoulBonus", -1)
+    if v == 0
+        _disableSoulBonus = False
+    elseif v == 1
+        _disableSoulBonus = True
+    endif
+
+    v = _CfgGetInt("Config", "UninstallMode", -1)
+    if v == 0
+        _uninstallMode = False
+    elseif v == 1
+        _uninstallMode = True
+    endif
+
+    ; Endless keys (config.json)
+    ; Endless.CHIM controls Endless opt-in:
+    ;   - 1 or "1" => Endless enabled
+    ;   - anything else (including missing) => Endless disabled
+    Int chimInt = _CfgGetInt("Endless", "CHIM", -2147483648)
+    String chimStr = _CfgGetString("Endless", "CHIM", "")
+    if chimInt == 1 || chimStr == "1"
+        _CHIM = 1
+    else
+        _CHIM = 0
+    endif
+
+    ; Feats keys (config.json)
+    ; Feats.DisableDragonSoulAnticheat=0/1
+    v = _CfgGetInt("Feats", "DisableDragonSoulAnticheat", -1)
+    if v == 0
+        disableDragonSoulAnticheat = False
+    elseif v == 1
+        disableDragonSoulAnticheat = True
+    endif
+
+    ; Feats.DisableDefiantFeat=0/1
+    v = _CfgGetInt("Feats", "DisableDefiantFeat", -1)
+    if v == 0
+        _disableDefiantSoulFeat = False
+    elseif v == 1
+        _disableDefiantSoulFeat = True
+    endif
+
+    ; Feats.DisableSoulTierFeats=0/1 (disables Silver/Gilded/Ebon/Platinum tier feats)
+    v = _CfgGetInt("Feats", "DisableSoulTierFeats", -1)
+    if v == 0
+        _disableSoulTierFeats = False
+    elseif v == 1
+        _disableSoulTierFeats = True
+    endif
+
+    ; Publish DSR enabled state for all scripts (DSR reads this GlobalVariable; avoids config reads during death events).
+    if IronSoulDSREnabledGV
+        if !_disableDragonSoulRevive
+            IronSoulDSREnabledGV.SetValue(1.0)
+        else
+            IronSoulDSREnabledGV.SetValue(0.0)
+        endif
+    endif
+
+    ; Respawn cooldown is fixed per mode (Iron Soul=3600s, Defiant Soul=3600s)
+    _respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS
+
+    ; If Dragon Soul Revive is disabled, clear any stale grace/pending state.
+    if _disableDragonSoulRevive
+        _pendingDeathCheck = False
+        _deathEventLocked = False
+        _dsrSoulsAtDeath = -1
+        _deathCheckAt = 0.0
+    endif
 EndFunction
 
 Function LogMsg(Int level, String msg)
@@ -287,9 +452,9 @@ Function LogMsg(Int level, String msg)
 		return
 	endif
 
-	; Level 3 (debug) stays in Papyrus log only.
-	; Levels 1-2 are also shown in the on-screen notification area.
-	if level != LOG_DBG()
+	; Config.LogNotificationMode controls whether level 1-2 logs are echoed to the HUD notification area.
+	; Level 3 (debug) never notifies (too spammy) and always stays in the Papyrus log.
+	if _logNotificationMode == 1 && level != LOG_DBG()
 		Debug.Notification(LogPrefix + " " + msg)
 	endif
 	Debug.Trace(LogPrefix + " " + msg)
@@ -304,14 +469,48 @@ Function DebugNotifyLevel3(String msg)
 	if _logLevel < LOG_DBG()
 		return
 	endif
-	Debug.Notification(LogPrefix + " [DBG] " + msg)
+	; Level 3 is intended for Papyrus log diagnostics only.
 	Debug.Trace(LogPrefix + " [DBG] " + msg)
 EndFunction
+
+;== ENDLESS (special CHIM) LOAD NOTIFICATION POOL
+;== Picks 1 of 10 short CHIM/Godhead lines and appends "Deaths: X / ???" on the same line.
+String Function _PickEndlessChimLine(Int idx)
+    ; Keep lines ASCII-only for maximum compiler/font compatibility.
+    if idx == 0
+        return "The Godhead dreams on."
+    elseif idx == 1
+        return "You remain within the Dream."
+    elseif idx == 2
+        return "The Dream does not end here."
+    elseif idx == 3
+        return "Knowing the Dream, you persist."
+    elseif idx == 4
+        return "You refuse to wake."
+    elseif idx == 5
+        return "The cycle continues by your will."
+    elseif idx == 6
+        return "You perceive the Dream and remain."
+    elseif idx == 7
+        return "Existence endures within the Dream."
+    elseif idx == 8
+        return "The Dreamer stirs."
+    else
+        return "You do not zero-sum."
+    endif
+EndFunction
+
+Function _NotifyEndlessChimLoad(Int deaths)
+    Int idx = Utility.RandomInt(0, 9)
+    String line = _PickEndlessChimLine(idx)
+    Debug.Notification(line + " Deaths: " + deaths + " / ???")
+EndFunction
+
 
 ;== END DEBUG LEVEL 3 – ON-SCREEN NOTIFICATION HELPER
 Function LogPropsOnce()
 	LogMsg(LOG_INFO(), "Props: RespawnQuest=" + (RespawnQuest != None) + " Running=" + (RespawnQuest != None && RespawnQuest.IsRunning()))
-	LogMsg(LOG_INFO(), "Config: Logging=" + _logEnabled + " Level=" + _logLevel + " CHIM=" + _CHIM)
+	LogMsg(LOG_INFO(), "Config: Logging=" + _logEnabled + " Level=" + _logLevel + " NotifyMode=" + _logNotificationMode + " CHIM=" + _CHIM)
 EndFunction
 
 ; ============================
@@ -345,7 +544,7 @@ Function _MarkAuthDirty(Bool markShared, Bool markMirror)
     endif
 EndFunction
 
-Float Property AuthFlushMinIntervalSeconds = 1.00 Auto ; throttle non-urgent JSON saves
+Float Property AuthFlushMinIntervalSeconds = 5.00 Auto ; throttle non-urgent JSON saves
 Float _lastAuthFlushAt = 0.0
 Function _FlushAuthJsonIfDirtyThrottled()
     ; Called from OnUpdate to avoid saving JSON every tick.
@@ -372,8 +571,12 @@ Function EnsureVisibleLogIfMissing(String guid)
 	if disp == ""
 		disp = JsonUtil.GetStringValue(MirrorPath, "LastKnownName:" + guid, "")
 	endif
+	; IMPORTANT: Never write a visible per-character JSON file using a provisional GUID.
+	; Before the first real load, characters may not have a stable GUID or name; avoid
+	; creating files like "242_79686_0_1_5388.json". Only write visible logs when we
+	; have a usable LastKnownName mapping.
 	if disp == ""
-		disp = guid
+		return
 	endif
 
 	String visFile = VisibleLogPath + "/" + disp
@@ -425,7 +628,8 @@ Function EnsureVisibleLogsOnLoad()
 
 	i = 0
 	while i < count
-		EnsureVisibleLogIfMissing(names[i])
+		; Registry name list is display-names, not GUIDs. EnsureVisibleLogIfMissing() is GUID-keyed.
+		; Visible logs are created opportunistically once LastKnownName:<guid> exists.
 		i += 1
 	endwhile
 EndFunction
@@ -452,6 +656,20 @@ EndFunction
 
 String Function GetPoemShownKeyById(String charId)
     return MakeKey("PoemShown", charId)
+EndFunction
+
+
+String Function GetFeatsDragonSoulsKeyById(String charId)
+    ; Trusted dragon souls obtained counter used for Feats tracking.
+    return MakeKey("FeatsDragonSoulsObtained", charId)
+EndFunction
+
+String Function GetFeatsLastSeenSoulsKeyById(String charId)
+    return MakeKey("FeatsLastSeenDragonSouls", charId)
+EndFunction
+
+String Function GetFeatsLastSeenSoulsRTKeyById(String charId)
+    return MakeKey("FeatsLastSeenDragonSoulsRT", charId)
 EndFunction
 
 String Function GetCooldownPlayedKeyById(String charId)
@@ -485,6 +703,133 @@ String Function _PoemShownStorageKey(String guid)
 EndFunction
 
 
+String Function _FeatsDragonSoulsStorageKey(String guid)
+    ; Co-save backup for FeatsDragonSoulsObtained counter (obfuscated key)
+    return MakeKey("RequiemHealthOffset", guid)
+EndFunction
+; =========================
+; SOUL TIER (OBFUSCATED INT)
+; =========================
+; Tier state: 0=Iron, 1=Gilded, 2=Platinum. Platinum always takes priority.
+; This value is mirrored to Shared/Mirror JSON and backed up to co-save via an obfuscated key.
+String Function GetSoulTierKeyById(String charId)
+    return MakeKey("InternalRuntimeUpdateState", charId)
+EndFunction
+
+String Function _SoulTierStorageKey(String guid)
+    ; Co-save backup key for soul tier (obfuscated).
+    return MakeKey("InternalRuntimeUpdateState", guid)
+EndFunction
+
+
+; Miraak defeated latch (Dragonborn DLC): used for the Platinum Soul feat unlock path.
+; We treat stage 580 (death scene) OR stage 600 (left Apocrypha cleanup) as "Miraak defeated".
+String Function GetMiraakKilledKeyById(String charId)
+    return MakeKey("RuntimeVsyncState", charId)
+EndFunction
+
+String Function _MiraakKilledStorageKey(String guid)
+    ; Co-save backup key for Miraak defeated latch (obfuscated).
+    return MakeKey("RuntimeVsyncState", guid)
+EndFunction
+
+Bool Function _IsMiraakDefeated(Actor player, String guid)
+    ; Per-character, latched once true. Eligibility thresholds are applied by the caller.
+    Int flag = _GetAuthInt(player, _MiraakKilledStorageKey(guid), GetMiraakKilledKeyById(guid), 0)
+    if flag == 1
+        return True
+    endif
+
+    if DLC2MQ06
+        ; Stages 580/600 (and quest completion) are used as the authoritative "Miraak defeated" signals. Stages 580/600 occur later in the sequence.
+        if DLC2MQ06.GetStageDone(580) || DLC2MQ06.GetStageDone(600) || DLC2MQ06.IsCompleted()
+            _SetAuthInt(player, _MiraakKilledStorageKey(guid), GetMiraakKilledKeyById(guid), 1, True)
+            ; If Miraak was just latched as defeated, schedule feats evaluation immediately.
+            TryScheduleFeats(player)
+            return True
+        endif
+    endif
+
+    return False
+EndFunction
+
+; One-time message gating for tier unlock popups (separate from tier int so we don't spam on load).
+String Function GetGildedMsgShownKeyById(String charId)
+    return MakeKey("SystemConsistencyCheckpoint", charId)
+EndFunction
+
+String Function _GildedMsgShownStorageKey(String guid)
+    ; Co-save backup key for gilded message gating (obfuscated).
+    return MakeKey("SystemConsistencyCheckpoint", guid)
+EndFunction
+
+String Function GetEbonMsgShownKeyById(String charId)
+    return MakeKey("PersistentRuntimeStateToken", charId)
+EndFunction
+
+String Function _EbonMsgShownStorageKey(String guid)
+    ; Co-save backup key for platinum message gating (obfuscated).
+    return MakeKey("PersistentRuntimeStateToken", guid)
+EndFunction
+
+; One-time message gating for Silver/Platinum tier unlock popups (separate from tier int so we don't spam on load).
+String Function GetSilverMsgShownKeyById(String charId)
+    return MakeKey("RuntimeBaselineHash", charId)
+EndFunction
+
+String Function _SilverMsgShownStorageKey(String guid)
+    ; Co-save backup key for silver message gating (obfuscated).
+    return MakeKey("RuntimeBaselineHash", guid)
+EndFunction
+
+String Function GetPlatinumMsgShownKeyById(String charId)
+    return MakeKey("RuntimeIntegritySeal", charId)
+EndFunction
+
+String Function _PlatinumMsgShownStorageKey(String guid)
+    ; Co-save backup key for platinum message gating (obfuscated).
+    return MakeKey("RuntimeIntegritySeal", guid)
+EndFunction
+
+; Defiant Feat + activation flags (Defiant affects death lifecycle, separate from the soul tier above).
+String Function GetDefiantFeatUnlockedKeyById(String charId)
+    return MakeKey("DefiantFeatUnlocked", charId)
+EndFunction
+
+String Function _DefiantFeatStorageKey(String guid)
+    ; Co-save backup key for Defiant Feat (obfuscated).
+    return MakeKey("PersistentSyncEvaluationIndex", guid)
+EndFunction
+
+String Function GetDefiantPendingKeyById(String charId)
+    return MakeKey("DefiantPendingActivation", charId)
+EndFunction
+
+String Function _DefiantPendingStorageKey(String guid)
+    ; Co-save backup key for Defiant activation pending flag (obfuscated).
+    return MakeKey("DeferredSystemStateMarker", guid)
+EndFunction
+
+String Function GetDefiantActivatedKeyById(String charId)
+    return MakeKey("DefiantActivated", charId)
+EndFunction
+
+String Function _DefiantActivatedStorageKey(String guid)
+    ; Co-save backup key for Defiant activated flag (obfuscated).
+    return MakeKey("DeferredSystemStateMarker:Active", guid)
+EndFunction
+
+String Function _FeatsLastSeenSoulsStorageKey(String guid)
+    ; Co-save backup key for Feats last-seen DragonSouls (obfuscated).
+    return MakeKey("RequiemStaggerThreshold:Souls", guid)
+EndFunction
+
+String Function _FeatsLastSeenRTStorageKey(String guid)
+    ; Co-save backup key for Feats last-seen timestamp (obfuscated).
+    return MakeKey("RequiemStaggerThreshold:RT", guid)
+EndFunction
+
+
 ; =====================
 ; AUTHORITATIVE STORAGE
 ; =====================
@@ -506,13 +851,19 @@ Int Function _GetAuthInt(Actor player, String storageKey, String jsonKey, Int de
 		Int vS = defaultValue
 		Int vM = defaultValue
 
-		if _jsonExistsShared && JsonUtil.HasIntValue(SharedPath, jsonKey)
-			hasS = True
-			vS = JsonUtil.GetIntValue(SharedPath, jsonKey, defaultValue)
+		if _jsonExistsShared
+			Int tmpS = JsonUtil.GetIntValue(SharedPath, jsonKey, _AUTH_INT_SENTINEL)
+			if tmpS != _AUTH_INT_SENTINEL
+				hasS = True
+				vS = tmpS
+			endif
 		endif
-		if _jsonExistsMirror && JsonUtil.HasIntValue(MirrorPath, jsonKey)
-			hasM = True
-			vM = JsonUtil.GetIntValue(MirrorPath, jsonKey, defaultValue)
+		if _jsonExistsMirror
+			Int tmpM = JsonUtil.GetIntValue(MirrorPath, jsonKey, _AUTH_INT_SENTINEL)
+			if tmpM != _AUTH_INT_SENTINEL
+				hasM = True
+				vM = tmpM
+			endif
 		endif
 
 		Int best = defaultValue
@@ -789,6 +1140,11 @@ String Function BuildProvisionalGuid(Actor player)
     ; Persist the provisional GUID in the co‑save.
     StorageUtil.SetStringValue(player, _guidStorageKey, guid)
 
+    ; Debug (Level 2): in-game trace for provisional GUID assignment.
+    if _logEnabled && _logLevel >= LOG_INFO()
+        Debug.Notification("Iron Soul: provisional GUID assigned -> " + guid)
+    endif
+
     ; Persist creation metadata into both shared and mirror stores.  These values
     ; assist with GUID recovery if the co‑save is deleted.
     JsonUtil.SetIntValue(SharedPath, "CreatedAt:" + guid, nowSec)
@@ -834,12 +1190,21 @@ Function FinalizeCharacterIdentity(Actor player, String guid)
     if !IsValidPlayerName(name)
         return
     endif
+    ; Determine whether this is the first time this GUID has been bound to a name.
+    Bool firstBind = False
+    String lkS = JsonUtil.GetStringValue(SharedPath, "LastKnownName:" + guid, "")
+    String lkM = JsonUtil.GetStringValue(MirrorPath, "LastKnownName:" + guid, "")
+    if lkS == "" && lkM == ""
+        firstBind = True
+    endif
+
     ; Tooling/debug metadata: allowed to create JSON stores if missing.
     _jsonExistsShared = True
     _jsonExistsMirror = True
     ; Record the last known name for this GUID.
     JsonUtil.SetStringValue(SharedPath, "LastKnownName:" + guid, name)
     JsonUtil.SetStringValue(MirrorPath, "LastKnownName:" + guid, name)
+    _MarkAuthDirty(True, True)
     ; Record the reverse mapping from name to GUID.
     JsonUtil.SetStringValue(SharedPath, "GUIDForName:" + name, guid)
     JsonUtil.SetStringValue(MirrorPath, "GUIDForName:" + name, guid)
@@ -860,6 +1225,12 @@ Function FinalizeCharacterIdentity(Actor player, String guid)
     ; Save changes immediately to persist finalization.
     _MarkAuthDirty(True, True)
     _FlushAuthJsonIfDirty()
+
+    ; Debug (Level 2): in-game trace for GUID finalization (fires only on first bind).
+    if firstBind && _logEnabled && _logLevel >= LOG_INFO()
+        Debug.Notification("Iron Soul: GUID finalized -> " + guid)
+    endif
+
     ; Clear waiting flag now that the identity has been bound.
     _waitingForFirstCellIdentity = False
 EndFunction
@@ -1100,6 +1471,16 @@ Bool Function IsValidPlayerName(String name)
 	return True
 EndFunction
 
+Bool Function _IsInMenuCached(Float nowRT)
+    if nowRT - _menuModeCachedAt < 0.25
+        return _menuModeCachedVal
+    endif
+    _menuModeCachedVal = Utility.IsInMenuMode()
+    _menuModeCachedAt = nowRT
+    return _menuModeCachedVal
+EndFunction
+
+
 ; Reset transient per-session state when a new character GUID is detected.  This helper
 ; clears various pending flags so that jobs do not leak across characters.
 Function ResetTransientStateForNewGuid(String guid)
@@ -1110,6 +1491,7 @@ Function ResetTransientStateForNewGuid(String guid)
     _pendingDisableRespawn = False
     _pendingDeathCheck = False
     _pendingLoadMessage = False
+    _pendingFeats = False
     _pendingDeathResync = False
     _bleedoutForcedKill = False
     _wasBleedingOut = False
@@ -1155,6 +1537,24 @@ Float _deathCheckAt = 0.0
 Int _dsrSoulsAtDeath = -1 
 Bool _pendingLoadMessage = False
 
+Float _pendingDisableRespawnStartedAt = 0.0
+Float _pendingLoadMessageStartedAt = 0.0
+Float _pendingDeathCheckStartedAt = 0.0
+Float Property PendingFastLoopWatchdogSeconds = 30.0 Auto ; safety: clear stuck fast-loop jobs
+
+
+
+; Feats of Strength (per character; delayed message display in safe context)
+Bool _pendingFeats = False
+Float _featsAt = 0.0
+Float _nextFeatsSoulCheckAt = 0.0
+String _featsCachedGuid = ""
+Float _featsCachedGuidExpiresAt = 0.0
+Bool _featsLastSeenInit = False
+Float _menuModeCachedAt = 0.0
+Bool _menuModeCachedVal = False
+
+
 Bool _wasBleedingOut = False
 Bool _bleedoutArmed  = False
 Bool _bleedoutForcedKill = False
@@ -1190,6 +1590,33 @@ EndFunction
 
 Function RescheduleIfJobsRemain()
     ; Keep the update loop tight while any short-lived jobs are pending.
+    ; Safety watchdog: if a fast-loop job gets stuck, clear it to avoid 0.10s polling forever.
+    Float nowRT = Utility.GetCurrentRealTime()
+
+    if _pendingDisableRespawn && _pendingDisableRespawnStartedAt > 0.0 && (nowRT - _pendingDisableRespawnStartedAt) > PendingFastLoopWatchdogSeconds
+        _pendingDisableRespawn = False
+        LogMsg(LOG_INFO(), "Watchdog: cleared _pendingDisableRespawn after " + (nowRT - _pendingDisableRespawnStartedAt) + "s")
+    endif
+    if _pendingLoadMessage && _pendingLoadMessageStartedAt > 0.0 && (nowRT - _pendingLoadMessageStartedAt) > PendingFastLoopWatchdogSeconds
+        _pendingLoadMessage = False
+        LogMsg(LOG_INFO(), "Watchdog: cleared _pendingLoadMessage after " + (nowRT - _pendingLoadMessageStartedAt) + "s")
+    endif
+    if _pendingDeathCheck && _pendingDeathCheckStartedAt > 0.0 && (nowRT - _pendingDeathCheckStartedAt) > PendingFastLoopWatchdogSeconds
+        _pendingDeathCheck = False
+        LogMsg(LOG_INFO(), "Watchdog: cleared _pendingDeathCheck after " + (nowRT - _pendingDeathCheckStartedAt) + "s")
+    endif
+
+    ; Reset start timers when jobs complete normally.
+    if !_pendingDisableRespawn
+        _pendingDisableRespawnStartedAt = 0.0
+    endif
+    if !_pendingLoadMessage
+        _pendingLoadMessageStartedAt = 0.0
+    endif
+    if !_pendingDeathCheck
+        _pendingDeathCheckStartedAt = 0.0
+    endif
+
     if _pendingDisableRespawn || _pendingLoadMessage || _pendingDeathCheck
         QueueUpdate(0.10)
     else
@@ -1231,6 +1658,12 @@ Function ScheduleLoadMessage(Bool isLoadGame, Actor player, String guid)
     ; Load message: always schedule on load (not suppressed by other pending messages).
     if isLoadGame
         _pendingLoadMessage = True
+
+        if _pendingLoadMessageStartedAt <= 0.0
+
+        	_pendingLoadMessageStartedAt = Utility.GetCurrentRealTime()
+
+        endif
         _loadMessageAt = Utility.GetCurrentRealTime() + LoadMessageDelay
     else
         _pendingLoadMessage = False
@@ -1268,9 +1701,7 @@ Function GameReloaded(Bool isLoadGame)
         SyncCurrentCharacterImmediate(guid)
         ; Read healed value and sync actor value
         Int deathsNow = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
-        ; Cache current mode + respawn cooldown for this load.
-        _isEndlessMode = (_CHIM == 1 && deathsNow >= DEFIANT_SOUL_MAX_LIVES)
-        _isDefiantMode = (_CHIM == 1 && deathsNow >= IRON_SOUL_MAX_LIVES && deathsNow < DEFIANT_SOUL_MAX_LIVES)
+        ; Cache respawn cooldown for this load.
         _respawnCooldownSeconds = RESPAWN_COOLDOWN_SECONDS
         _SyncDeathAV(player, deathsNow)
         ; Enforce essential/quest state using current identity
@@ -1306,6 +1737,7 @@ Event OnUpdate()
         return
     endif
 
+
     ; Deferred death‑AV resync: if a load scheduled a delayed sync, perform it once when
     ; the specified real‑time has been reached.  We check early in the update loop so the
     ; correct death count is written before other handlers run.  After syncing once the
@@ -1329,6 +1761,11 @@ Event OnUpdate()
     HandleRespawnCooldown(player)
     ; Timed load‑message handler
     HandleLoadMessage(player)
+    ; Feats: dragon souls anti-cheat tracking (performance-friendly)
+    FeatsAntiCheatTick(player)
+    ; Feats of Strength evaluation (unlock messages)
+    TryScheduleFeats(player)
+    HandleFeats(player)
     ; Delayed true-death confirmation (no free respawn branch)
     if HandlePendingDeathCheck(player)
         return
@@ -1349,6 +1786,7 @@ Event OnUpdate()
     ; Flush pending authoritative JSON writes (throttled to reduce disk churn)
     _FlushAuthJsonIfDirtyThrottled()
 EndEvent
+
 
 ; ====================
 ; RESPAWN AND COOLDOWN
@@ -1415,10 +1853,15 @@ Function TickRespawnCooldown(Actor player, String guid)
 
 	if delta > 0
 		played += delta
-		_SetAuthInt(player, "", GetCooldownPlayedKeyById(guid), _EncodePlayed(nowSec, played), False)
+		Int newPlayedTok = _EncodePlayed(nowSec, played)
+		if newPlayedTok != playedTok
+			_SetAuthInt(player, "", GetCooldownPlayedKeyById(guid), newPlayedTok, False)
+		endif
 	endif
 
-	_SetAuthInt(player, "", GetCooldownLastKeyById(guid), nowSec, False)
+	if nowSec != lastSec
+		_SetAuthInt(player, "", GetCooldownLastKeyById(guid), nowSec, False)
+	endif
 
 	;==============================================================
 	;== DEBUG LEVEL 3 – COOLDOWN PROGRESS HUD
@@ -1608,17 +2051,9 @@ Function HandleBleedoutRespawn(Actor player)
     if !player
         return
     endif
-
-    String name = player.GetDisplayName()
     String guid = GetCharacterGUID(player)
     if guid == ""
         return
-    endif
-
-    ; keep name for logs only
-    if IsValidPlayerName(name)
-        JsonUtil.SetStringValue(SharedPath, "LastKnownName:" + guid, name)
-        JsonUtil.SetStringValue(MirrorPath, "LastKnownName:" + guid, name)
     endif
 
     int usedTok = _GetAuthInt(player, "", GetRespawnKeyById(guid), 0)
@@ -1636,10 +2071,11 @@ Function HandleBleedoutRespawn(Actor player)
             String poem = "Some are said to carry an Iron Soul."
             poem += "\nSuch souls do not yield as others do."
             poem += "\nThey may fall, yet not be claimed at once."
-            poem += "\nEach return draws deeper from the iron."
+            poem += "\nEach return draws deeper from the iron within."
+            poem += "\nSoul Bonus: +10% damage dealt, −10% damage taken."
             poem += "\n\nYour soul may endure " + IRON_SOUL_MAX_LIVES + " deaths."
             poem += "\nWhen it is spent, nothing remains to rise."
-            Utility.Wait(2.0)
+
             Debug.MessageBox(poem)
             ; Also show the normal respawn reminder immediately on the first free respawn.
             _pendingRespawnWarning = False
@@ -1650,6 +2086,12 @@ Function HandleBleedoutRespawn(Actor player)
         _pendingRespawnWarning = True
         _respawnWarningArmed = False
         _pendingDisableRespawn = True
+
+        if _pendingDisableRespawnStartedAt <= 0.0
+
+        	_pendingDisableRespawnStartedAt = Utility.GetCurrentRealTime()
+
+        endif
 
         _updateQueued = False
         QueueUpdate(DisableRespawnPollSeconds)
@@ -1668,68 +2110,511 @@ Function HandleRespawnCooldown(Actor player)
 EndFunction
 
 Function HandleLoadMessage(Actor player)
-    ; Job A: timed load-game job (runs every load).
-    if _pendingLoadMessage
-        if Utility.GetCurrentRealTime() >= _loadMessageAt
-            _pendingLoadMessage = False
+    ; Job A: timed load-game job (runs every load). Fatal enforcement must never be
+    ; suppressed by notification settings.
+    if !_pendingLoadMessage
+        return
+    endif
 
-            if !player
-                return
-            endif
+    if Utility.GetCurrentRealTime() < _loadMessageAt
+        return
+    endif
 
-            String name = player.GetDisplayName()
-            String guid = GetCharacterGUID(player)
-            if guid == ""
-                return
-            endif
+    _pendingLoadMessage = False
 
-            ; Write last-known name (best-effort)
-            if IsValidPlayerName(name)
-                JsonUtil.SetStringValue(SharedPath, "LastKnownName:" + guid, name)
-                JsonUtil.SetStringValue(MirrorPath, "LastKnownName:" + guid, name)
+    if !player
+        return
+    endif
+
+    String name = player.GetDisplayName()
+    String guid = GetCharacterGUID(player)
+    if guid == ""
+        return
+    endif
+
+    ; Write last-known name (best-effort)
+    if IsValidPlayerName(name)
+        JsonUtil.SetStringValue(SharedPath, "LastKnownName:" + guid, name)
+        JsonUtil.SetStringValue(MirrorPath, "LastKnownName:" + guid, name)
+    else
+        name = "Player"
+    endif
+
+    Int deaths = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
+
+    Int maxLives = _GetEffectiveMaxLives(player, guid, deaths)
+    Int usedTok  = _GetAuthInt(player, "", GetRespawnKeyById(guid), 0)
+    Int used     = _DecodeFlag(usedTok)
+
+    ; Defiant activation is NOT controlled by CHIM. It is earned (Defiant Feat) under Iron Soul,
+    ; then activated only after the 10th-death Defiant transition + next load.
+    Int defPending = _GetAuthInt(player, _DefiantPendingStorageKey(guid), GetDefiantPendingKeyById(guid), 0)
+    Int defActive  = _GetAuthInt(player, _DefiantActivatedStorageKey(guid), GetDefiantActivatedKeyById(guid), 0)
+
+    if defPending == 1 && defActive != 1
+        ; We just returned from the 10th-death Defiant transition (THIS IS NOT THE END).
+        ; Activate Defiant now (deaths become measured against 100) and show the entry message once.
+        defActive  = 1
+        defPending = 0
+
+        _SetAuthInt(player, _DefiantActivatedStorageKey(guid), GetDefiantActivatedKeyById(guid), 1, True)
+        _SetAuthInt(player, _DefiantPendingStorageKey(guid),   GetDefiantPendingKeyById(guid),   0, True)
+
+        ; Keep the legacy obfuscated co-save marker intact (do not rename/remove).
+        String kDef = "RequiemStaminaBoost:" + guid
+        if StorageUtil.GetIntValue(player, kDef, 0) != 1
+            StorageUtil.SetIntValue(player, kDef, 1)
+        endif
+
+        Debug.MessageBox("Death claimed you. You refused.\nDefiant Soul awakened.")
+    endif
+
+    Bool defiant = (defActive == 1 && deaths >= IRON_SOUL_MAX_LIVES && deaths < DEFIANT_SOUL_MAX_LIVES)
+
+    ; Endless opt-in is controlled by Endless.CHIM (see LoadConfig()).
+    ; If Defiant is not enabled, Endless begins once deaths reach the Iron cap.
+    ; If Defiant is enabled (pending or active), Endless begins once deaths reach the Defiant cap.
+    Int endlessStart = IRON_SOUL_MAX_LIVES
+    if defActive == 1 || defPending == 1
+        endlessStart = DEFIANT_SOUL_MAX_LIVES
+    endif
+    Bool endless = (_CHIM == 1 && deaths >= endlessStart)
+
+    ; Cached Soul Tier for load messaging (0=Iron, 1=Silver, 2=Gilded, 3=Ebon, 4=Platinum).
+    Int soulTier = _GetAuthInt(player, _SoulTierStorageKey(guid), GetSoulTierKeyById(guid), 0)
+
+    ; Enforce fallen saves unless Endless mode is active.
+    if deaths >= maxLives
+        if !endless
+            Debug.MessageBox("NO STRENGTH REMAINS TO RISE\nYOUR SOUL IS CLAIMED\nSOVNGARDE AWAITS THE FALLEN")
+            Game.QuitToMainMenu()
+            return
+        endif
+    endif
+
+    ; Load notifications are always enabled.
+    ; Priority: Endless > Defiant > Soul Tier (death-band flavor)
+    ; NOTE (future): Soul Bonuses (Iron 10% / Silver 15% / Gilded 20% / Ebon 25% / Platinum 30%) are TODO
+    ; and must be fully suppressed while Defiant mode is active.
+    if endless
+        ; When Endless is enabled (CHIM opt-in), always use the special CHIM/Godhead load notification pool.
+        _NotifyEndlessChimLoad(deaths)
+
+    elseif defiant
+        ; After 75 deaths in Defiant mode, show a “rest” warning instead of the usual line.
+        if deaths >= 75
+            Debug.Notification("Your soul yearns for rest.")
+        else
+            Debug.Notification("Your Defiant Soul endures.")
+        endif
+
+    else
+        ; Tier name for flavor lines.
+        String tierName = "Iron"
+        if soulTier == 4
+            tierName = "Platinum"
+        elseif soulTier == 3
+            tierName = "Ebon"
+        elseif soulTier == 2
+            tierName = "Gilded"
+        elseif soulTier == 1
+            tierName = "Silver"
+        endif
+
+        ; Death-band flavor (under 10 deaths):
+        ; 0: peerless (Platinum special: defies fate)
+        ; 1–3: prevails
+        ; 4–6: rises stronger
+        ; 7–9: endures
+        if deaths <= 0
+            if soulTier == 4
+                Debug.Notification("Your Platinum Soul defies fate.")
             else
-                name = "Player"
+                Debug.Notification("Your " + tierName + " Soul is peerless.")
             endif
+        elseif deaths <= 3
+            Debug.Notification("Your " + tierName + " Soul prevails.")
+        elseif deaths <= 6
+            Debug.Notification("Your " + tierName + " Soul rises stronger.")
+        else
+            Debug.Notification("Your " + tierName + " Soul endures.")
+        endif
 
-            Int deaths = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
-            Int maxLives = _GetEffectiveMaxLives(player, guid, deaths)
-            Int usedTok = _GetAuthInt(player, "", GetRespawnKeyById(guid), 0)
-            Int used = _DecodeFlag(usedTok)
-
-            Bool endless = (_CHIM == 1 && deaths >= DEFIANT_SOUL_MAX_LIVES)
-            Bool defiant = (_CHIM == 1 && deaths >= IRON_SOUL_MAX_LIVES && deaths < DEFIANT_SOUL_MAX_LIVES)
-
-            ; One-time Defiant Soul entry message (never shown for Endless).
-            if defiant
-                String kDef = "RequiemStaminaBoost:" + guid
-                if StorageUtil.GetIntValue(player, kDef, 0) != 1
-                    StorageUtil.SetIntValue(player, kDef, 1)
-                    Debug.MessageBox("Death claimed you. You refused.\nDefiant Soul awakened.")
-                endif
-            endif
-
-            ; Enforce fallen saves unless Endless mode is active.
-            if deaths >= maxLives
-                if !endless
-                    Debug.MessageBox("NO STRENGTH REMAINS TO RISE\nYOUR SOUL IS CLAIMED\nSOVNGARDE AWAITS THE FALLEN")
-                    Game.QuitToMainMenu()
-                    return
-                endif
-            endif
-            ; Load notifications are always enabled.
-            if endless
-                Debug.Notification("Your soul yearns for rest. Deaths: " + deaths + " / ???")
-            elseif defiant
-                Debug.Notification("Your Defiant Soul endures. Deaths: " + deaths + " / " + DEFIANT_SOUL_MAX_LIVES)
-            else
-                Debug.Notification("Your Iron Soul endures. Deaths: " + deaths + " / " + IRON_SOUL_MAX_LIVES)
-                if used > 0 && !_disableFatalReminderMessage
-                    Debug.Notification("Your recent trial has left you shaken.")
-                endif
+        ; Keep the Iron-only reminder behavior as-is.
+        if soulTier == 0
+            if used > 0 && !_disableFatalReminderMessage
+                Debug.Notification("Your recent trial has left you unnerved.")
             endif
         endif
     endif
 EndFunction
+
+
+; ================================
+; FEATS SOUL TRACKING (ANTI-CHEAT)
+; ================================
+
+Function FeatsAntiCheatTick(Actor player)
+    if disableDragonSoulAnticheat
+        return
+    endif
+    if !player || player.IsDead() || player.IsBleedingOut()
+        return
+    endif
+
+    Float nowRT = Utility.GetCurrentRealTime()
+    if _IsInMenuCached(nowRT)
+        return
+    endif
+    Int nowSec = nowRT as Int
+    ; Run at low frequency (~5s) to avoid overhead.
+    if _nextFeatsSoulCheckAt != 0.0 && nowRT < _nextFeatsSoulCheckAt
+        return
+    endif
+    _nextFeatsSoulCheckAt = nowRT + 5.0
+
+    String guid = _featsCachedGuid
+    if guid == "" || nowRT >= _featsCachedGuidExpiresAt
+        guid = GetCharacterGUID(player)
+        _featsCachedGuid = guid
+        _featsCachedGuidExpiresAt = nowRT + 60.0
+        _featsLastSeenInit = False
+    endif
+    if guid == ""
+        return
+    endif
+
+    Int curSouls = player.GetActorValue("DragonSouls") as Int
+
+    ; Last seen values are backed up to co-save (obfuscated) and mirrored to JSON when available.
+    Int lastSouls = _GetAuthInt(player, _FeatsLastSeenSoulsStorageKey(guid), GetFeatsLastSeenSoulsKeyById(guid), curSouls)
+    Int delta = curSouls - lastSouls
+
+    Int lastSec = _GetAuthInt(player, _FeatsLastSeenRTStorageKey(guid), GetFeatsLastSeenSoulsRTKeyById(guid), nowSec)
+    Float dt = (nowSec - lastSec) as Float
+
+    Bool suspicious = False
+    if delta > 3
+        suspicious = True
+    endif
+    if !suspicious
+        if dt < 60.0 && delta > 6
+            suspicious = True
+        endif
+    endif
+
+    ; Debug notification for suspicious jumps (only when diagnostics enabled).
+    if delta > 0 && suspicious && _logLevel >= 2
+        Debug.Notification("[Iron Soul][Feats] Unusual Dragon Soul increase detected (Δ=" + delta + "); Feats progress not updated.")
+    endif
+
+    if delta > 0 && !suspicious
+        Int featsSouls = _GetAuthInt(player, _FeatsDragonSoulsStorageKey(guid), GetFeatsDragonSoulsKeyById(guid), 0)
+        featsSouls = featsSouls + delta
+        _SetAuthInt(player, _FeatsDragonSoulsStorageKey(guid), GetFeatsDragonSoulsKeyById(guid), featsSouls, True)
+
+        ; Trigger Feats evaluation soon (message boxes must be shown in a safe context).
+        ; If all Feats are disabled via JSON, we still track the counter but do not schedule messaging.
+        if !_disableDefiantSoulFeat || !_disableSoulTierFeats
+            _pendingFeats = True
+            if _featsAt < (nowRT + 4.0)
+                _featsAt = nowRT + 4.0
+            endif
+        endif
+
+        ; Update visible per-character JSON field for transparency.
+                ; Visible Feats JSON is only written once a stable name mapping exists.
+        ; (Avoids pre-first-load writes and prevents provisional/GUID filenames.)
+        String disp = JsonUtil.GetStringValue(SharedPath, "LastKnownName:" + guid, "")
+        if !IsValidPlayerName(disp)
+            disp = JsonUtil.GetStringValue(MirrorPath, "LastKnownName:" + guid, "")
+        endif
+        if IsValidPlayerName(disp)
+            EnsureVisibleLogIfMissing(guid)
+            String visFile = VisibleLogPath + "/" + disp
+            Int curVis = JsonUtil.GetIntValue(visFile, "Feats: Dragon Souls Obtained", -2147483648)
+            if curVis != featsSouls
+                JsonUtil.SetIntValue(visFile, "Feats: Dragon Souls Obtained", featsSouls)
+                JsonUtil.Save(visFile)
+            endif
+        endif
+    endif ; delta > 0 && !suspicious
+
+
+    ; --- Miraak poll (Platinum Soul gating) ---
+    ; Miraak's defeat is a scripted quest sequence; there is no reliable actor OnDeath hook to lean on.
+    ; To make Platinum Soul unlock feel "near-immediate" even when no Dragon Soul delta occurs,
+    ; we poll the Dragonborn quest state on the same low-frequency cadence as the soul anti-cheat tick.
+    ;
+    ; Performance notes:
+    ;  - Only runs when the player has already obtained enough souls to possibly qualify (>= 25).
+    ;  - Only polls until a per-character latch flag is set, then becomes a cheap O(1) read.
+    ;
+    ; If Miraak is detected as defeated for the first time, _IsMiraakDefeated() will latch the flag
+    ; and immediately call TryScheduleFeats(player) so HandleFeats can grant Platinum in a safe context.
+    Int soulsObtainedForTiers = _GetAuthInt(player, _FeatsDragonSoulsStorageKey(guid), GetFeatsDragonSoulsKeyById(guid), 0)
+    if soulsObtainedForTiers >= 25
+        Int miraakFlag = _GetAuthInt(player, _MiraakKilledStorageKey(guid), GetMiraakKilledKeyById(guid), 0)
+        if miraakFlag != 1
+            _IsMiraakDefeated(player, guid)
+        endif
+    endif
+
+    ; Advance last seen so we don't repeatedly flag the same jump.
+    ; Skip unchanged writes after first initialization to reduce co-save churn at 5s cadence.
+    if !_featsLastSeenInit || curSouls != lastSouls || nowSec != lastSec
+        _SetAuthInt(player, _FeatsLastSeenSoulsStorageKey(guid), GetFeatsLastSeenSoulsKeyById(guid), curSouls, False)
+        _SetAuthInt(player, _FeatsLastSeenRTStorageKey(guid), GetFeatsLastSeenSoulsRTKeyById(guid), nowSec, False)
+        _featsLastSeenInit = True
+    endif
+EndFunction
+
+; ===========================
+; SOUL TIER FEATS JOB
+; ===========================
+
+Function TryScheduleFeats(Actor player)
+    ; Schedules Feats evaluation when an unlock may be available.
+    ; (Messages are shown by HandleFeats in a safe context; this function only arms the delayed check.)
+    if !player
+        return
+    endif
+    if _pendingFeats
+        return
+    endif
+
+    String guid = GetCharacterGUID(player)
+    if guid == ""
+        return
+    endif
+
+    Float nowRT = Utility.GetCurrentRealTime()
+    if _IsInMenuCached(nowRT) || player.IsDead() || player.IsBleedingOut()
+        return
+    endif
+
+    Int deaths = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
+    Int soulsObtained = _GetAuthInt(player, _FeatsDragonSoulsStorageKey(guid), GetFeatsDragonSoulsKeyById(guid), 0)
+
+    ; Defiant Feat: 1 Dragon Soul obtained with under 10 deaths.
+    if !_disableDefiantSoulFeat
+        Bool defiantEligible = (soulsObtained >= 1 && deaths < IRON_SOUL_MAX_LIVES)
+        Int defFeat = _GetAuthInt(player, _DefiantFeatStorageKey(guid), GetDefiantFeatUnlockedKeyById(guid), 0)
+        if defiantEligible && defFeat != 1
+            _pendingFeats = True
+            if _featsAt < (nowRT + 4.0)
+                _featsAt = nowRT + 4.0
+            endif
+            return
+        endif
+    endif
+
+    
+    ; Soul Tier Feats (prestige tiers; do not affect death lifecycle).
+    ; Option A: grant only the highest eligible tier.
+    if !_disableSoulTierFeats
+        ; Under 10 deaths only.
+        Int desiredTier = 0
+        if deaths < IRON_SOUL_MAX_LIVES
+            Bool miraakKilled = False
+            if soulsObtained >= 25
+                miraakKilled = _IsMiraakDefeated(player, guid)
+            endif
+            if miraakKilled && soulsObtained >= 25
+                desiredTier = 4 ; Platinum
+            elseif soulsObtained >= 25
+                desiredTier = 3 ; Ebon
+            elseif soulsObtained >= 10
+                desiredTier = 2 ; Gilded
+            elseif soulsObtained >= 5
+                desiredTier = 1 ; Silver
+            endif
+        endif
+
+        Int curTier = _GetAuthInt(player, _SoulTierStorageKey(guid), GetSoulTierKeyById(guid), 0)
+
+        if desiredTier > curTier
+            _pendingFeats = True
+            if _featsAt < (nowRT + 4.0)
+                _featsAt = nowRT + 4.0
+            endif
+            return
+        endif
+
+        ; Also schedule one-time tier messages if a tier was previously earned but its message wasn't shown yet.
+        if curTier == 4
+            Int shownA = _GetAuthInt(player, _PlatinumMsgShownStorageKey(guid), GetPlatinumMsgShownKeyById(guid), 0)
+            if shownA != 1
+                _pendingFeats = True
+                if _featsAt < (nowRT + 4.0)
+                    _featsAt = nowRT + 4.0
+                endif
+                return
+            endif
+        elseif curTier == 3
+            Int shownP = _GetAuthInt(player, _EbonMsgShownStorageKey(guid), GetEbonMsgShownKeyById(guid), 0)
+            if shownP != 1
+                _pendingFeats = True
+                if _featsAt < (nowRT + 4.0)
+                    _featsAt = nowRT + 4.0
+                endif
+                return
+            endif
+        elseif curTier == 2
+            Int shownG = _GetAuthInt(player, _GildedMsgShownStorageKey(guid), GetGildedMsgShownKeyById(guid), 0)
+            if shownG != 1
+                _pendingFeats = True
+                if _featsAt < (nowRT + 4.0)
+                    _featsAt = nowRT + 4.0
+                endif
+                return
+            endif
+        elseif curTier == 1
+            Int shownS = _GetAuthInt(player, _SilverMsgShownStorageKey(guid), GetSilverMsgShownKeyById(guid), 0)
+            if shownS != 1
+                _pendingFeats = True
+                if _featsAt < (nowRT + 4.0)
+                    _featsAt = nowRT + 4.0
+                endif
+                return
+            endif
+        endif
+    endif
+EndFunction
+
+Function HandleFeats(Actor player)
+    ; One-time Feats of Strength messaging + tier state updates.
+    if !_pendingFeats
+        return
+    endif
+
+    Float nowRT = Utility.GetCurrentRealTime()
+    if nowRT < _featsAt
+        return
+    endif
+
+    ; If we can't safely show a message box right now, retry shortly.
+    if _IsInMenuCached(nowRT) || !player || player.IsDead() || player.IsBleedingOut()
+        _featsAt = nowRT + 1.0
+        return
+    endif
+
+    String guid = GetCharacterGUID(player)
+    if guid == ""
+        ; GUID not ready yet (early-load edge case). Keep pending and retry shortly.
+        _featsAt = nowRT + 1.0
+        return
+    endif
+
+    _pendingFeats = False
+
+    Int deaths = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
+    Int soulsObtained = _GetAuthInt(player, _FeatsDragonSoulsStorageKey(guid), GetFeatsDragonSoulsKeyById(guid), 0)
+
+    ; ---- Defiant Feat (eligibility only; activation occurs after the 10th-death transition + next load) ----
+    if !_disableDefiantSoulFeat
+        Bool defiantEligible = (soulsObtained >= 1 && deaths < IRON_SOUL_MAX_LIVES)
+        Int defFeat = _GetAuthInt(player, _DefiantFeatStorageKey(guid), GetDefiantFeatUnlockedKeyById(guid), 0)
+        if defiantEligible && defFeat != 1
+            _SetAuthInt(player, _DefiantFeatStorageKey(guid), GetDefiantFeatUnlockedKeyById(guid), 1, True)
+
+            String msgD = "1 Dragon Soul has been claimed, its fury bound to a single purpose.\n"
+            msgD += "Death Count: " + deaths + " / " + IRON_SOUL_MAX_LIVES + "\n\n"
+            msgD += "You have unlocked Defiant Soul:\n"
+            msgD += "After your 10th death, you refuse the halls of Sovngarde and rise again,\n"
+            msgD += "your defiance measured by a new limit of 100 deaths but you lose your Soul Bonus."
+            Debug.MessageBox(msgD)
+            return
+        endif
+    endif
+
+    ; ---- Soul Tier Feats (prestige tiers; do not affect death lifecycle) ----
+    ; Option A: grant only the highest eligible tier.
+    if !_disableSoulTierFeats
+        Int desiredTier = 0
+        Bool miraakKilled = False
+        if deaths < IRON_SOUL_MAX_LIVES
+            if soulsObtained >= 25
+                miraakKilled = _IsMiraakDefeated(player, guid)
+            endif
+            if miraakKilled && soulsObtained >= 25
+                desiredTier = 4 ; Platinum
+            elseif soulsObtained >= 25
+                desiredTier = 3 ; Ebon
+            elseif soulsObtained >= 10
+                desiredTier = 2 ; Gilded
+            elseif soulsObtained >= 5
+                desiredTier = 1 ; Silver
+            endif
+        endif
+
+        ; Tier state: 0=Iron, 1=Silver, 2=Gilded, 3=Ebon, 4=Platinum. Highest eligible tier always takes priority.
+        Int curTier = _GetAuthInt(player, _SoulTierStorageKey(guid), GetSoulTierKeyById(guid), 0)
+
+        if desiredTier > curTier
+            _SetAuthInt(player, _SoulTierStorageKey(guid), GetSoulTierKeyById(guid), desiredTier, True)
+            ; Co-save mirror (obfuscated) is handled by _SetAuthInt via the storageKey parameter.
+            ; Future: Apply Soul Bonus tiers (Iron 10% / Silver 15% / Gilded 20% / Ebon 25% / Platinum 30%) unless Defiant activates.
+            ;         All Soul Bonuses are lost once Defiant activates (after the 10th-death Defiant transition + next load).
+            curTier = desiredTier
+        endif
+
+        ; One-time tier messages (separate from tier int so we never spam messages on load).
+        if curTier == 4
+            Int shownA = _GetAuthInt(player, _PlatinumMsgShownStorageKey(guid), GetPlatinumMsgShownKeyById(guid), 0)
+            if shownA != 1
+                _SetAuthInt(player, _PlatinumMsgShownStorageKey(guid), GetPlatinumMsgShownKeyById(guid), 1, True)
+                String msgA = ""
+                msgA = "The First Dragonborn is no more.\n"
+                msgA += "His end was hidden even from those who watch all things.\n"
+                msgA += "Death Count: " + deaths + " / " + IRON_SOUL_MAX_LIVES + "\n\n"
+                msgA += "You have unlocked Platinum Soul:\n"
+                msgA += "Soul Bonus: +30% damage dealt, −30% damage taken."
+                Debug.MessageBox(msgA)
+                return
+            endif
+        elseif curTier == 3
+            Int shownP = _GetAuthInt(player, _EbonMsgShownStorageKey(guid), GetEbonMsgShownKeyById(guid), 0)
+            if shownP != 1
+                _SetAuthInt(player, _EbonMsgShownStorageKey(guid), GetEbonMsgShownKeyById(guid), 1, True)
+                String msgP = ""
+                msgP = "25 Dragon Souls have been claimed, their fury bound to a single purpose.\n"
+                msgP += "Death Count: " + deaths + " / " + IRON_SOUL_MAX_LIVES + "\n\n"
+                msgP += "You have unlocked Ebon Soul:\n"
+                msgP += "Soul Bonus: +25% damage dealt, −25% damage taken."
+                Debug.MessageBox(msgP)
+                return
+            endif
+        elseif curTier == 2
+            Int shownG = _GetAuthInt(player, _GildedMsgShownStorageKey(guid), GetGildedMsgShownKeyById(guid), 0)
+            if shownG != 1
+                _SetAuthInt(player, _GildedMsgShownStorageKey(guid), GetGildedMsgShownKeyById(guid), 1, True)
+                String msgG = ""
+                msgG = "10 Dragon Souls have been claimed, their fury bound to a single purpose.\n"
+                msgG += "Death Count: " + deaths + " / " + IRON_SOUL_MAX_LIVES + "\n\n"
+                msgG += "You have unlocked Gilded Soul:\n"
+                msgG += "Soul Bonus: +20% damage dealt, −20% damage taken."
+                Debug.MessageBox(msgG)
+                return
+            endif
+        elseif curTier == 1
+            Int shownS = _GetAuthInt(player, _SilverMsgShownStorageKey(guid), GetSilverMsgShownKeyById(guid), 0)
+            if shownS != 1
+                _SetAuthInt(player, _SilverMsgShownStorageKey(guid), GetSilverMsgShownKeyById(guid), 1, True)
+                String msgS = ""
+                msgS = "5 Dragon Souls have been claimed, their fury bound to a single purpose.\n"
+                msgS += "Death Count: " + deaths + " / " + IRON_SOUL_MAX_LIVES + "\n\n"
+                msgS += "You have unlocked Silver Soul:\n"
+                msgS += "Soul Bonus: +15% damage dealt, −15% damage taken."
+                Debug.MessageBox(msgS)
+                return
+            endif
+        endif
+    endif
+
+    endif
+EndFunction
+
 
 Function HandleRespawnWarning(Actor player)
     ; Job W: delayed free-respawn warning (after respawn completes)
@@ -1878,6 +2763,11 @@ Function HandlePlayerDying(Actor akKiller)
 		_respawnWarningArmed = False
 		_pendingDisableRespawn = True
 
+        if _pendingDisableRespawnStartedAt <= 0.0
+            _pendingDisableRespawnStartedAt = Utility.GetCurrentRealTime()
+        endif
+
+
 		_updateQueued = False
 		QueueUpdate(DisableRespawnPollSeconds)
 
@@ -1902,6 +2792,12 @@ Function HandlePlayerDying(Actor akKiller)
 		_dsrSoulsAtDeath = soulsNow
 	_deathEventLocked = True
 	_pendingDeathCheck = True
+
+	if _pendingDeathCheckStartedAt <= 0.0
+
+		_pendingDeathCheckStartedAt = Utility.GetCurrentRealTime()
+
+	endif
 	_deathCheckAt = Utility.GetCurrentRealTime() + NoRespawnDeathCheckDelaySeconds
 	_updateQueued = False
 	QueueUpdate(0.50)
@@ -1911,76 +2807,90 @@ Function HandlePlayerDying(Actor akKiller)
 	; No souls available: do NOT arm grace. This is a true death.
 	_dsrSoulsAtDeath = -1
 	LogMsg(LOG_INFO(), "TRUE DEATH: no dragon souls available; skipping DSR grace window")
-    Utility.Wait(3.0)
+	Utility.Wait(3.0)
+	_deathEventLocked = True
 	TrueDeathAndQuit(player)
 	return
 EndFunction
 
 Function TrueDeathAndQuit(Actor player)
-	if !player
-		return
-	endif
+    if !player
+        return
+    endif
 
-	String name = player.GetDisplayName()
-	String guid = GetCharacterGUID(player)
-	if guid == ""
-		LogMsg(LOG_ERR(), "TRUE DEATH: missing CharacterGUID; exiting without logging state")
-		if !_disableDeathMessage
-		    Debug.MessageBox("SOVNGARDE CALLS\n\nDeath occurred but IronSoul could not determine character identity. Exiting to prevent state corruption.")
-		endif
-		Utility.Wait(2.0)
-		Debug.QuitGame()
-		return
-	endif
+    String name = player.GetDisplayName()
+    String guid = GetCharacterGUID(player)
+    if guid == ""
+        LogMsg(LOG_ERR(), "TRUE DEATH: missing CharacterGUID; exiting without logging state")
+        if !_disableDeathMessage
+            Debug.MessageBox("SOVNGARDE CALLS\n\nDeath occurred but Iron Soul could not determine character identity. Exiting to prevent state corruption.")
+        endif
+        Utility.Wait(2.0)
+        Debug.QuitGame()
+        return
+    endif
 
-	if !IsValidPlayerName(name)
-		name = "Player"
-	endif
+    ; Record the death in authoritative stores (Shared/Mirror JSON with co-save floor).
+    IncrementTrueDeath(player, guid, name)
 
-	LogMsg(LOG_INFO(), "TRUE DEATH: logging and exiting game for " + name + " GUID=" + guid)
-	IncrementTrueDeath(player, guid, name)
+    ; TRUE DEATH cycle reset: allow a new free respawn next run, and clear cooldown (load must not do this)
+    ResetRespawnUsed(player, guid)
+    Int nowSec = Utility.GetCurrentRealTime() as Int
+    _SetAuthInt(player, "", GetCooldownPlayedKeyById(guid), _EncodePlayed(nowSec, 0), False)
+    _SetAuthInt(player, "", GetCooldownLastKeyById(guid), nowSec, True)
 
-	; TRUE DEATH cycle reset: allow a new free respawn next run, and clear cooldown (load must not do this)
-	ResetRespawnUsed(player, guid)
-	Int nowSec = Utility.GetCurrentRealTime() as Int
-	_SetAuthInt(player, "", GetCooldownPlayedKeyById(guid), _EncodePlayed(nowSec, 0), False)
-	_SetAuthInt(player, "", GetCooldownLastKeyById(guid), nowSec, True)
 
-	Utility.Wait(1.0)
+    Utility.Wait(1.0)
 
     player.GetActorBase().SetEssential(False)
 
-	int deathsNow = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
+    Int deathsNow = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
 
-    ; Hard cap used for "final death" handling:
-    ;  - Iron Soul: IRON_SOUL_MAX_LIVES
-    ;  - Defiant Soul: DEFIANT_SOUL_MAX_LIVES (only if CHIM=1 and deathsNow >= IRON_SOUL_MAX_LIVES)
-    ; Note: Endless mode is an explicit post-cap opt-in done by the player after reaching DEFIANT_SOUL_MAX_LIVES,
-    ; so TRUE DEATH at 100 should still force CHIM back to 0 by default.
+    ; --- Defiant transition handling ---
+    ; If the player earned the Defiant Feat (3 Dragon Souls under 10 deaths), the 10th death still ends the run,
+    ; but instead of a true permadeath we perform a Defiant transition:
+    ;  - Show "THIS IS NOT THE END" and Debug.QuitGame()
+    ;  - Do NOT write CHIM unlock state
+    ;  - On next load, Defiant activates and deaths are measured against 100
+    Int defFeat = _GetAuthInt(player, _DefiantFeatStorageKey(guid), GetDefiantFeatUnlockedKeyById(guid), 0)
+    Int defActive = _GetAuthInt(player, _DefiantActivatedStorageKey(guid), GetDefiantActivatedKeyById(guid), 0)
+    if deathsNow == IRON_SOUL_MAX_LIVES && defFeat == 1 && defActive != 1
+        _SetAuthInt(player, _DefiantPendingStorageKey(guid), GetDefiantPendingKeyById(guid), 1, True)
+
+        Debug.MessageBox("THIS IS NOT THE END\n\nDeaths: " + IRON_SOUL_MAX_LIVES + " / " + IRON_SOUL_MAX_LIVES)
+
+        JsonUtil.Save(SharedPath)
+        JsonUtil.Save(MirrorPath)
+        Utility.Wait(1.0)
+        Debug.QuitGame()
+        return
+    endif
+
+    ; Hard cap for true permadeath enforcement.
+    ; Defiant is NOT controlled by CHIM; Defiant only applies if it has been activated (post-transition).
     Int hardCap = IRON_SOUL_MAX_LIVES
-    if _CHIM == 1 && deathsNow >= IRON_SOUL_MAX_LIVES
+    if defActive == 1 && deathsNow >= IRON_SOUL_MAX_LIVES
         hardCap = DEFIANT_SOUL_MAX_LIVES
     endif
 
     if deathsNow == hardCap
-        ; Character is fallen. Force CHIM off by default so continuing requires an explicit opt-in.
-        JsonUtil.SetIntValue(LogConfigPath, "CHIM", 0)
-        JsonUtil.Save(LogConfigPath)
+        ; True permadeath scenario:
+        ;  - 10th death without Defiant
+        ;  - 100th death with Defiant active
         Debug.MessageBox("NO STRENGTH REMAINS TO RISE\nYOUR SOUL IS CLAIMED\nSOVNGARDE AWAITS THE FALLEN")
     else
         if !_disableDeathMessage
-		    Debug.MessageBox("SOVNGARDE CALLS\n\nDeath Count: " + deathsNow)
-	    endif
+            Debug.MessageBox("SOVNGARDE CALLS\n\nDeath Count: " + deathsNow + " / " + hardCap)
+        endif
     endif
 
-    ; Give the player time to read the message box before quitting.  During this wait we ensure
-    ; that all JSON state is flushed to disk so deaths and cooldowns are persisted.  Without
-    ; explicitly saving here, the VM may exit before writes complete.
+    ; Ensure all JSON state is flushed to disk before exiting to main menu.
     JsonUtil.Save(SharedPath)
     JsonUtil.Save(MirrorPath)
-	Utility.Wait(1.0)
-	Debug.QuitGame()
+    Utility.Wait(1.0)
+    Game.QuitToMainMenu()
 EndFunction
+
 
 Function FailSafeUnlockIfStable(Actor player)
     ; If the player is stable again and no death-related jobs are pending,
@@ -2014,6 +2924,7 @@ Bool Function HandlePendingDeathCheck(Actor player)
     endif
 
     Float nowRT = Utility.GetCurrentRealTime()
+    Int nowSec = nowRT as Int
     if nowRT < _deathCheckAt
         ; Keep the loop alive during the grace window.
         _updateQueued = False
@@ -2081,34 +2992,34 @@ EndFunction
 ; ==============
 ; UNINSTALL MODE
 ; ==============
-;
+
 ; When UninstallMode=1 in config:
-;  - Iron Soul disables itself (no death enforcement / no gameplay systems).
-;  - A one-time cleanup pass clears risky runtime state (deferred kill / ghost / paralysis).
-;  - IMPORTANT: Respawn is intentionally left ENABLED.
-;       * We do NOT stop RespawnQuest here.
-;       * We keep the player Essential so Respawn can continue to intercept death.
-;  - The controller quest stops itself once cleanup completes.
-;
-; If the user wants to uninstall Respawn too, they should use Respawn’s own uninstall/MCM,
-; which will stop its quests and restore Essential as needed.
+;  - All Iron Soul functionality is disabled.
+;  - A one-time cleanup pass clears any risky runtime state (deferred kill / essential / ghost / paralysis).
+;  - The controller quest stops itself.
 Function HandleUninstallMode(Actor player)
     ; If uninstall has already completed in this save, keep the quest permanently inert.
     if _uninstallRan
         if !_uninstallNotified
             _uninstallNotified = True
-            Debug.MessageBox(
-                "Iron Soul has been safely disabled.\n" + \
-                "Respawn remains enabled.\n\n" + \
-                "Make a new save now.\n" + \
-                "You may now uninstall Iron Soul, or leave it installed in its disabled state."
-            )
+            Debug.MessageBox("Iron Soul has been safely disabled.\nYou may now uninstall the mod, or leave it installed in its disabled state.")
         endif
         Stop()
         return
     endif
 
-    ; Stage 0: cancel pending Iron Soul jobs so no gameplay logic runs during cleanup.
+    String guid = GetCharacterGUID(player)
+    if guid != ""
+        Int deaths = _GetAuthInt(player, _DeathsStorageKey(guid), GetDeathKeyById(guid), 0)
+        Int maxLives = _GetEffectiveMaxLives(player, guid, deaths)
+        if deaths >= maxLives
+            Debug.MessageBox("This character has already fallen.")
+            Game.QuitToMainMenu()
+            return
+        endif
+    endif
+
+    ; Stage 0: cancel pending jobs so no gameplay logic runs during cleanup.
     if _uninstallStage == 0
         _pendingDisableRespawn = False
         _pendingLoadMessage = False
@@ -2117,12 +3028,9 @@ Function HandleUninstallMode(Actor player)
         _respawnWarningArmed = False
         _pendingDeathResync = False
 
-        ; IMPORTANT: Do NOT stop RespawnQuest in uninstall mode.
-        ; Respawn relies on the player being Essential and will manage its own lifecycle/uninstall.
+        ; Stop linked respawn quest, if any.
         if RespawnQuest
-            if !RespawnQuest.IsRunning()
-                RespawnQuest.Start()
-            endif
+            RespawnQuest.Stop()
         endif
 
         _uninstallStage = 1
@@ -2130,14 +3038,8 @@ Function HandleUninstallMode(Actor player)
         return
     endif
 
-    if !player
-        QueueUpdate(0.25)
-        return
-    endif
-
     ; Stage 1: release any deferred-kill state while the player is protected.
     if _uninstallStage == 1
-        ; Keep player protected while we clear risky states.
         player.GetActorBase().SetEssential(True)
         player.EndDeferredKill()
 
@@ -2150,7 +3052,7 @@ Function HandleUninstallMode(Actor player)
         return
     endif
 
-    ; Stage 2: restore and clear flags, remove optional Iron Soul assets, then stop this quest.
+    ; Stage 2: restore and clear flags, remove optional DSR assets, then stop this quest.
     if _uninstallStage == 2
         if Utility.GetCurrentRealTime() < _uninstallAt
             QueueUpdate(0.10)
@@ -2160,11 +3062,9 @@ Function HandleUninstallMode(Actor player)
         player.RestoreAV("Health", 1000.0)
         player.SetGhost(False)
         player.SetAV("Paralysis", 0.0)
+        player.GetActorBase().SetEssential(False)
 
-        ; IMPORTANT: Leave player Essential so Respawn can continue to function.
-        player.GetActorBase().SetEssential(True)
-
-        ; Optional: remove Iron Soul DSR spells/quest if provided.
+        ; Optional: remove DSR spells/quest if provided.
         if DRAbility && player.HasSpell(DRAbility)
             player.RemoveSpell(DRAbility)
         endif
@@ -2179,9 +3079,7 @@ Function HandleUninstallMode(Actor player)
 
         if !_uninstallNotified
             _uninstallNotified = True
-            Debug.MessageBox(
-                "Iron Soul has been safely disabled.\n" + "Make a new save now." + "You may now uninstall the mod, or leave it installed in its disabled state."
-            )
+            Debug.MessageBox("Iron Soul has been safely disabled.\nYou may now uninstall the mod, or leave it installed in its disabled state.")
         endif
 
         Stop()
@@ -2216,42 +3114,43 @@ EndFunction
 Bool Function ValidateOrHealRegistry(String regPath)
 	String checkPath = GetRegistryCheckPath(regPath)
 
-	; If snapshot exists, enforce it: if registry is missing or differs, restore from snapshot.
+	; Snapshot policy: the snapshot is a protected baseline. The registry may grow,
+	; but it may not lose snapshot entries. We do NOT delete registry additions.
 	if RegistrySnapshotExists(checkPath)
 		int snapCount = JsonUtil.GetIntValue(checkPath, "Count", 0)
-		int regCount  = RegistryGetCount(regPath)
 
-		Bool mismatch = False
-		if regCount != snapCount
-			mismatch = True
-		else
-			int i = 0
-			Bool _breakMismatch = False
-			while i < snapCount && !_breakMismatch
-				String rn = RegistryGetName(regPath, i)
-				String sn = JsonUtil.GetStringValue(checkPath, "Shadow_Name_" + i, "")
-				if rn != sn
-					mismatch = True
-                    ; Exit the loop early on first mismatch
-					_breakMismatch = True
+		Bool changed = False
+		int i = 0
+		while i < snapCount
+			String sn = JsonUtil.GetStringValue(checkPath, "Shadow_Name_" + i, "")
+			if sn != ""
+				; If a snapshot GUID is missing from the registry (crash / partial write / tamper),
+				; restore it by appending. Do not rewrite or shrink the registry.
+				if !RegistryHasName(regPath, sn)
+					int c = RegistryGetCount(regPath)
+					if c < RegistryMaxNames
+						JsonUtil.SetStringValue(regPath, "Name_" + c, sn)
+						JsonUtil.SetIntValue(regPath, "Count", c + 1)
+						changed = True
+					endif
 				endif
-				i += 1
-			endwhile
-		endif
+			endif
+			i += 1
+		endwhile
 
-		if mismatch
-			LogMsg(LOG_INFO(), "Registry integrity mismatch for " + regPath + " -> restoring from snapshot")
-			RestoreRegistryFromSnapshot(regPath)
+		if changed
+			LogMsg(LOG_INFO(), "Registry baseline healed for " + regPath + " (restored missing snapshot entries)")
+			JsonUtil.Save(regPath)
 		endif
-
 		return True
 	endif
 
 	; No snapshot yet: create one from current registry contents (even if empty),
-	; so future manual edits can be detected and reverted.
+	; so future deletions/rewrites can be detected and the baseline can be restored.
 	WriteRegistrySnapshot(regPath)
 	return True
 EndFunction
+
 
 Bool Function RegistryHasName(String regPath, String n)
 	int c = RegistryGetCount(regPath)
@@ -2293,7 +3192,7 @@ Int Function BuildRegistryUnion(String[] outNames)
 	; Fills outNames with the union of Shared+Mirror registry GUIDs. Returns count.
 	int outCount = 0
 
-	; Enforce snapshot integrity first (reverts manual edits to registries)
+	; Enforce snapshot baseline first (restores missing snapshot entries; does not remove additions)
 	ValidateOrHealRegistry(RegistrySharedPath)
 	ValidateOrHealRegistry(RegistryMirrorPath)
 

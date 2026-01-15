@@ -1,13 +1,27 @@
 {
-	"int" : 
-	{
-		"DisableDeathMessage" : 0,
-		"DisableDragonSoulRevive" : 0,
-		"DisableFatalReminderMessage" : 0,
-		"DisableRespawnMessage" : 0,
-		"EnableCharacterSheetCompatibility" : 0,
-		"EnableLogging" : 0,
-		"LogLevel" : 2,
-		"UninstallMode" : 0
-	}
+  "Config": {
+    "DisableDeathMessage": 0,
+    "DisableDragonSoulRevive": 0,
+    "DisableFatalReminderMessage": 0,
+    "DisableRespawnMessage": 0,
+    "DisableSoulBonus": 0,
+    "EnableLogging": 0,
+    "LogLevel": 2,
+    "LogNotificationMode": 0,
+    "UninstallMode": 0
+  },
+
+  "Feats": {
+    "DisableDefiantFeat": 0,
+    "DisableSoulTierFeats": 0,
+    "DisableDragonSoulAnticheat": 0
+  },
+
+  "Endless": {
+    "CHIM": 0
+  },
+
+  "Experimental": {
+    "EnableCharacterSheetCompatibility": 0
+  }
 }
