@@ -13,11 +13,35 @@ FormList Property BeastList Auto
 Globalvariable Property DRIsDead Auto
 GlobalVariable Property IronSoulDSREnabledGV Auto ; 1.0 = enabled, 0.0 = disabled (set by Iron Soul)
 
+IronSoulControllerQuestScript Property IronSoulController Auto ; Iron Soul controller (for tier/Defiant menu resolution)
+
 Bool Function _IsDSREnabled()
 	if IronSoulDSREnabledGV
 		return (IronSoulDSREnabledGV.GetValue() != 0.0)
 	endif
 	return True ; fail-open if property not filled
+EndFunction
+
+String Function _ResolveDSRMenuName(Actor player)
+    if IronSoulController
+        String m = IronSoulController.ResolveDragonSoulReviveMenuForPlayer(player)
+        if m != ""
+            return m
+        endif
+    endif
+    ; Fallback if controller/property isn't filled.
+    return "1irondragonsoulrevive"
+EndFunction
+
+Function _ShowDSRMenu(String menuName)
+    if menuName == ""
+        return
+    endif
+    if !UI.IsMenuOpen(menuName)
+        UI.OpenCustomMenu(menuName, 0)
+        Utility.WaitMenuMode(4.0)
+        UI.CloseCustomMenu()
+    endif
 EndFunction
 
 Bool Property bPlaysound = True Auto ;Play Sound or not
@@ -73,8 +97,9 @@ Event OnEffectStart(Actor Target, Actor Caster)
             ;Debug.Notification("Cast Spell")
 
             Target.DamageAV("DragonSouls", 1.0)
-            Int soulsRemaining = Target.GetAV("DragonSouls") as Int
-            Debug.MessageBox("A Dragon Soul burns within you.\nDragon Souls Remaining: " + soulsRemaining)
+            ; Contextual Dragon Soul Revive menu (tier/Defiant) – shown for 4 seconds.
+            String menuName = _ResolveDSRMenuName(Target)
+            _ShowDSRMenu(menuName)
             Target.AddSpell(RestoreSpell,false)
             DRIsDead.SetValue(0)
 
